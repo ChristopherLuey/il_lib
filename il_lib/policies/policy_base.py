@@ -185,9 +185,10 @@ class BasePolicy(LightningModule, ABC):
             terminated, truncated = self.evaluator.step()
             if self.online_eval_config.cfg.write_video:
                 self.evaluator._write_video()
-            if terminated or truncated:
-                done = True
+            if terminated:
                 self.evaluator.env.reset()
+            if truncated:
+                done = True
         if self.online_eval_config.cfg.write_video:
             self.evaluator.video_writer = None
         self.test_id += 1

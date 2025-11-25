@@ -24,7 +24,7 @@ wd: 0.0
 bs: 64
 vbs: ${bs}
 data_dir: ???
-eval_interval: 30
+eval_interval: 100
 online_eval: null
 
 horizon: ???
