@@ -178,7 +178,7 @@ class BasePolicy(LightningModule, ABC):
             os.makedirs("videos", exist_ok=True)
             self.evaluator.video_writer = create_video_writer(
                 fpath=video_name,
-                resolution=(240, 600),
+                resolution=(224, 448),
             )
         done = False
         while not done:
