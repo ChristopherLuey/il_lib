@@ -18,6 +18,7 @@ class BehaviorDataModule(LightningDataModule):
         val_split_ratio: float,
         dataloader_num_workers: int,
         seed: int,
+        shuffle: bool,
         max_num_demos: Optional[int] = None,
         dataset_class: str,
         **kwargs,
@@ -31,6 +32,7 @@ class BehaviorDataModule(LightningDataModule):
         self._val_split_ratio = val_split_ratio
         self._max_num_demos = max_num_demos
         self._seed = seed
+        self._shuffle = shuffle
         self._dataset_class = dataset_class
         # store args and kwargs for dataset initialization
         self._args = args
@@ -77,6 +79,7 @@ class BehaviorDataModule(LightningDataModule):
             pin_memory=True,
             persistent_workers=True,
             drop_last=True,
+            shuffle=self._shuffle,
         )
 
     def val_dataloader(self) -> DataLoader:
