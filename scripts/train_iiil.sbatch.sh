@@ -2,7 +2,7 @@
 #SBATCH --job-name="train_iiil"
 #SBATCH --account=viscam
 #SBATCH --partition=svl,viscam
-#SBATCH --exclude=svl1
+#SBATCH --exclude=svl12,svl13,svl14,svl15
 #SBATCH --nodes=2
 #SBATCH --gres=gpu:titanrtx:8
 #SBATCH --ntasks-per-node=8
@@ -28,7 +28,6 @@ echo "working directory="$SLURM_SUBMIT_DIR
 source /vision/u/wsai/miniconda3/bin/activate behavior
 
 export NCCL_IB_DISABLE=1
-export NCCL_NET_GDR_LEVEL=0
 
 srun python train.py gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES "$@"
 
