@@ -12,6 +12,7 @@ from il_lib.optim import CosineScheduleFunction, default_optimizer_groups, check
 from il_lib.policies.policy_base import BasePolicy
 from il_lib.training.trainer import rank_zero_info
 from il_lib.utils.array_tensor_utils import any_slice, get_batch_size
+from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
 from pytorch_lightning.utilities.types import OptimizerLRScheduler
 from typing import Any, Dict, List, Optional
 
@@ -131,13 +132,9 @@ class WBVIMA(BasePolicy):
             else:
                 prop_obs.append(obs[prop_key])
         prop_obs = torch.cat(prop_obs, dim=-1)  # (B, L, Prop_dim)
-        obs_to_pass_in = {
-            "proprioception": prop_obs,
-            "pcd": obs["pcd"],
-        }  # (B, L, E), where L is interleaved modalities tokens
-        if "task" in self._features:
-            obs_to_pass_in["task"] = obs["task"]
-        obs_tokens = self.obs_tokenizer(obs_to_pass_in) 
+        obs["proprioception"] = prop_obs
+        obs = {k: obs[k] for k in self._features}  # filter obs to only include features we have
+        obs_tokens = self.obs_tokenizer(obs) 
         B, _, E = obs_tokens.shape
         action_readout_tokens = self.action_readout_token.view(1, 1, -1).expand(
             B, self.num_latest_obs, -1
@@ -419,17 +416,21 @@ class WBVIMA(BasePolicy):
         return action_readout_tokens
     
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
-        fused_pcd = data_batch["obs"]["pcd"]
-        data = {
-            "pcd": {
-                "rgb": fused_pcd[..., :3],
-                "xyz": fused_pcd[..., 3:],
-            },
-            "qpos": data_batch["obs"]["qpos"],
-            "eef": data_batch["obs"]["eef"],
-        }
+        # process observation data
+        data = {"qpos": data_batch["obs"]["qpos"], "eef": data_batch["obs"]["eef"]}
         if "odom" in data_batch["obs"]:
             data["odom"] = data_batch["obs"]["odom"]
+        if "rgb" in self._features:
+            data["rgb"] = {k.rsplit("::", 1)[0]: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k}
+        if "rgbd" in self._features:
+            rgb = {k.rsplit("::", 1)[0]: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k}
+            depth = {k.rsplit("::", 1)[0]: (data_batch["obs"][k].float() - MIN_DEPTH) / (MAX_DEPTH - MIN_DEPTH) for k in data_batch["obs"] if "depth" in k}
+            data["rgbd"] = {k: torch.cat([rgb[k], depth[k].unsqueeze(-3)], dim=-3) for k in rgb}
+        if "pcd" in self._features:
+            data["pcd"] = {
+                "rgb": data_batch["obs"]["pcd"][..., :3],
+                "xyz": data_batch["obs"]["pcd"][..., 3:],
+            }
         if "task" in self._features:
             data["task"] = data_batch["obs"]["task"]
         if extract_action:
