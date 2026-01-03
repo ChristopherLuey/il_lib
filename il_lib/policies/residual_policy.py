@@ -3,13 +3,12 @@ import torch
 from hydra import instantiate
 from il_lib.nn.distributions import GMMHead, CategoricalNet
 from il_lib.policies.policy_base import BasePolicy
-from il_lib.nn.features import SimpleFeatureFusion, PointNet, Embedding, Identity
+from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.optim import CosineScheduleFunction
 from il_lib.utils.training_utils import freeze_params, load_state_dict
-from il_lib.utils.convert_utils import any_to_torch_tensor
 from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
 from omegaconf import DictConfig
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 class ResidualPolicy(BasePolicy):
@@ -17,6 +16,7 @@ class ResidualPolicy(BasePolicy):
         self,
         *args,
         prop_dim: int,
+        prop_keys: List[str],
         # ====== Feature Extractors ======
         feature_extractors: Dict[str, DictConfig],
         feature_fusion_hidden_depth: int = 1,
@@ -52,6 +52,9 @@ class ResidualPolicy(BasePolicy):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+
+        self._prop_dim = prop_dim
+        self._prop_keys = prop_keys
 
         self._features = set(feature_extractors.keys())
         self.feature_extractor = SimpleFeatureFusion(
