@@ -1,6 +1,6 @@
 import os
 import torch
-from hydra import instantiate
+from hydra.utils import instantiate
 from il_lib.nn.distributions import GMMHead, CategoricalNet
 from il_lib.policies.policy_base import BasePolicy
 from il_lib.nn.features import SimpleFeatureFusion
@@ -33,6 +33,8 @@ class ResidualPolicy(BasePolicy):
         action_net_activation: str = "relu",
         gmm_low_noise_eval: bool = True,
         # ====== Intervention ======
+        learn_gripper_action: bool = True,
+        include_robot_gripper_action_input: bool = True,
         intervention_head_hidden_dim: int,
         intervention_head_hidden_depth: int,
         intervention_head_activation: str = "relu",
@@ -119,7 +121,8 @@ class ResidualPolicy(BasePolicy):
 
         self._deterministic_inference = deterministic_inference
         self._intervention_loss_weight = intervention_loss_weight
-
+        self._learn_gripper_action = learn_gripper_action
+        self._include_robot_gripper_action_input = include_robot_gripper_action_input
         # ====== Learning ======
         self.lr = lr
         self.use_cosine_lr = use_cosine_lr
@@ -143,6 +146,7 @@ class ResidualPolicy(BasePolicy):
         obs["proprioception"] = prop_obs
         obs = {k: obs[k] for k in self._features}  # filter obs to only include features we have
         obs_feature = self.feature_extractor(obs)  # (B, T_O, D)
+        print(obs_feature.shape)
         action_dist = self.action_net(obs_feature)
         intervention_dist = self.intervention_head(obs_feature)
         return action_dist, intervention_dist
@@ -209,21 +213,20 @@ class ResidualPolicy(BasePolicy):
         batch = self.process_data(batch, extract_action=True)
 
         pad_mask = batch.pop("masks")
-        intervention_mask = batch.pop("is_oracle_active")
+        intervention_mask = batch.pop("int_state") == 2  # intervention happened
         # only valid when both intervention and pad mask are True
         action_valid_mask = intervention_mask & pad_mask
-
         # get residual action target
         robot_policy_action = batch["base_action"]
         oracle_action = batch["oracle_action"]
         # separate q action and gripper action
         robot_policy_action, robot_policy_gripper_action = (
             robot_policy_action[..., :-1],
-            robot_policy_action[..., -1],
+            robot_policy_action[..., -1:],
         )
         oracle_action, oracle_gripper_action = (
             oracle_action[..., :-1],
-            oracle_action[..., -1],
+            oracle_action[..., -1:],
         )
         # rectify gripper action from [-1, 1] to {0, 1}
         robot_policy_gripper_action = torch.where(
@@ -234,15 +237,15 @@ class ResidualPolicy(BasePolicy):
         residual_gripper = oracle_gripper_action - robot_policy_gripper_action
 
         # TODO: normalize residual_q to [-1, 1]
-        residual_q = (residual_q - delta_q_lower_limits) / (
-            delta_q_upper_limits - delta_q_lower_limits
-        ) * 2 - 1
-        if self.learn_gripper_action:
+        # residual_q = (residual_q - delta_q_lower_limits) / (
+        #     delta_q_upper_limits - delta_q_lower_limits
+        # ) * 2 - 1
+        if self._learn_gripper_action:
             # gripper change action is already in {-1, 1} so we can use GMM to optimize both q and gripper action
             target_action = torch.cat([residual_q, residual_gripper], dim=-1)
         else:
             target_action = residual_q
-        if self.include_robot_gripper_action_input:
+        if self._include_robot_gripper_action_input:
             batch["robot_policy_gripper_action"] = robot_policy_gripper_action
         # forward pass
         pi, intervention_dist = self.forward(batch)
@@ -259,8 +262,8 @@ class ResidualPolicy(BasePolicy):
             mask=pad_mask,
         )
         real_batch_size = action_valid_mask.sum()
-        action_loss = torch.sum(torch.stack(action_loss)) / real_batch_size
-        intervention_loss = (torch.sum(torch.stack(intervention_loss)) / pad_mask.sum())
+        action_loss = torch.sum(action_loss) / real_batch_size
+        intervention_loss = (torch.sum(intervention_loss) / pad_mask.sum())
         loss = action_loss + self._intervention_loss_weight * intervention_loss
         log_dict = {
             "action_loss": action_loss,
@@ -290,8 +293,9 @@ class ResidualPolicy(BasePolicy):
         if extract_action:
             # extract (correction-related) action from data_batch
             data.update({
-                "base_action": data_batch["base_action"],
-                "oracle_action": data_batch["oracle_action"],
+                "int_state": data_batch["policy"]["int_state"],
+                "base_action": data_batch["policy"]["base_action"],
+                "oracle_action": data_batch["policy"]["oracle_action"],
                 "masks": data_batch["masks"],
             })
         return data

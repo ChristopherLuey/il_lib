@@ -610,7 +610,7 @@ class MixtureOfGaussian:
         # the log probability computation will be correct
         assert len(dist.batch_shape) == 1
 
-        assert actions.shape[:-1] == batch_dims
+        assert actions.shape[:-1] == batch_dims, f"{actions.shape} vs {batch_dims}"
         actions = actions.reshape(-1, actions.shape[-1])
         log_probs = dist.log_prob(actions)  # (...,), note that action dim is summed
         log_probs = log_probs.reshape(*batch_dims)

@@ -24,15 +24,14 @@ wd: 0.0
 bs: 64
 vbs: ${bs}
 data_dir: ???
-eval_interval: 100
+max_steps: 2e5
+val_check_interval: 1e4  
+check_val_every_n_epoch: null
 online_eval: null
 
 horizon: ???
 num_latest_obs: ???
 deployed_action_steps: ???
-
-# ====== Action Keys ======
-action_key_dims: ???  # filled by roobt
 
 # ====== Wandb ======
 use_wandb: true
@@ -54,7 +53,6 @@ module:
   lr_cosine_min: ${lr_cosine_min}
   lr_layer_decay: ${lr_layer_decay}
   weight_decay: ${wd}
-  action_keys: ${action_keys}
 
 # ====== Data Module ======
 data:
@@ -93,23 +91,15 @@ trainer:
   benchmark: true  # enables cudnn.benchmark
   accumulate_grad_batches: 1
   num_sanity_val_steps: 1
-  max_epochs: 999999999
-  val_check_interval: null
-  check_val_every_n_epoch: ${eval_interval}
+  max_steps: ${max_steps}
+  val_check_interval: ${val_check_interval}
+  check_val_every_n_epoch: ${check_val_every_n_epoch}
   gradient_clip_val: 1.0
   fast_dev_run: false
   use_distributed_sampler: true
   checkpoint:  # this sub-dict will be popped to send to ModelCheckpoint as args
-  - filename: "epoch{epoch}-train_loss{train/loss:.5f}"
-    save_on_train_epoch_end: true  # this is a training metric, so we save it at the end of training epoch
-    save_top_k: 10
-    save_last: true
-    monitor: "train/loss"
-    mode: min
-    auto_insert_metric_name: false  # prevent creating subfolder caused by the slash
-  - filename: "epoch{epoch}-val_l1_{val/l1:.5f}"
+  - filename: "step_{step}-epoch_{epoch}-loss_{val/l1:.4f}"
     save_top_k: -1
-    save_last: true
     monitor: "val/l1"
     mode: min
     auto_insert_metric_name: false  # prevent creating subfolder caused by the slash
