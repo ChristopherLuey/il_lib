@@ -3,7 +3,7 @@
 #SBATCH --account=viscam
 #SBATCH --partition=svl,viscam
 #SBATCH --exclude=svl12,svl13,svl14,svl15
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --gres=gpu:titanrtx:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --mem=490G
@@ -24,6 +24,8 @@ echo "SLURM_MEM_PER_NODE="$SLURM_MEM_PER_NODE
 echo "SLURM_NNODES"=$SLURM_NNODES
 echo "SLURM_NTASKS_PER_NODE"=$SLURM_NTASKS_PER_NODE
 echo "working directory="$SLURM_SUBMIT_DIR
+
+echo "Running with args: $@"
 
 source /vision/u/wsai/miniconda3/bin/activate behavior
 

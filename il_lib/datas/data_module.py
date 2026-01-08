@@ -52,7 +52,7 @@ class BehaviorDataModule(LightningDataModule):
             self._train_demo_keys, self._val_demo_keys = train_test_split(
                 all_demo_keys,
                 test_size=self._val_split_ratio,
-                random_state=self._seed,
+                shuffle=False,
             )
             # initialize datasets
             self._train_dataset = DatasetClassModule(
