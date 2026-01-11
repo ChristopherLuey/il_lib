@@ -1,37 +1,53 @@
 import hydra
+from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from il_lib.utils.config_utils import register_omegaconf_resolvers
 from il_lib.utils.training_utils import load_state_dict, load_torch
 from omegaconf import OmegaConf
 from omnigibson.learning.utils.network_utils import WebsocketPolicyServer
+import os
+import sys
 
 
-@hydra.main(config_name="base_config", config_path="il_lib/configs", version_base="1.1")
-def main(cfg):
-    register_omegaconf_resolvers()
-    OmegaConf.resolve(cfg)
-    OmegaConf.set_struct(cfg, False)
-    policy = instantiate(cfg.module, _recursive_=False)
-    ckpt = load_torch(
-        cfg.ckpt_path,
-        map_location="cpu",
-    )
-    load_state_dict(
-        policy,
-        ckpt["state_dict"],
-        strict=True
-    )
-    policy = policy.to("cuda")
-    policy.eval()
-    # instantiate wrapper for policy
-    policy_wrapper = instantiate(cfg.policy_wrapper)
-    policy_wrapper.policy = policy
-    server = WebsocketPolicyServer(
-        policy=policy_wrapper,
-        host="0.0.0.0",
-        port=8000,
-    )
-    server.serve_forever()
+def main():
+    # Initialize Hydra with logging disabled for serve mode
+    config_dir = os.path.join(os.path.dirname(__file__), "il_lib/configs")
+    config_dir = os.path.abspath(config_dir)
+    
+    with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
+        # Compose config with Hydra logging disabled
+        overrides = sys.argv[1:] + [
+            "hydra.output_subdir=null",
+            "hydra.run.dir=.",
+            "hydra/job_logging=none",
+            "hydra/hydra_logging=none"
+        ]
+        cfg = compose(config_name="base_config", overrides=overrides)
+        
+        register_omegaconf_resolvers()
+        OmegaConf.resolve(cfg)
+        OmegaConf.set_struct(cfg, False)
+        policy = instantiate(cfg.module, _recursive_=False)
+        ckpt = load_torch(
+            cfg.ckpt_path,
+            map_location="cpu",
+        )
+        load_state_dict(
+            policy,
+            ckpt["state_dict"],
+            strict=True
+        )
+        policy = policy.to("cuda")
+        policy.eval()
+        # instantiate wrapper for policy
+        policy_wrapper = instantiate(cfg.policy_wrapper)
+        policy_wrapper.policy = policy
+        server = WebsocketPolicyServer(
+            policy=policy_wrapper,
+            host="0.0.0.0",
+            port=8000,
+        )
+        server.serve_forever()
 
 
 if __name__ == "__main__":
