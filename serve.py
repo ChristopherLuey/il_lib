@@ -1,6 +1,7 @@
 import hydra
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
+from il_lib.policies import ResidualPolicy
 from il_lib.utils.config_utils import register_omegaconf_resolvers
 from il_lib.utils.training_utils import load_state_dict, load_torch
 from omegaconf import OmegaConf

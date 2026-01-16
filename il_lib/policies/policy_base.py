@@ -414,3 +414,97 @@ class PolicyWrapper:
                         )
                     break
         return processed_obs
+
+
+class ResidualPolicyWrapper(PolicyWrapper):
+    """
+    A specialized wrapper for ResidualPolicy that manages both base policy and residual policy
+    with different action execution frequencies.
+    
+    Base policy: Predicts action chunks (e.g., 16 actions every 16 steps)
+    Residual policy: Predicts per-step corrections (1 correction every step)
+    """
+
+    def __init__(
+        self,
+        *args,
+        base_deployed_action_steps: int,  # Base policy's action chunk size
+        residual_deployed_action_steps: int = 1,  # Residual policy's action step (usually 1)
+        **kwargs,
+    ) -> None:
+        # Initialize parent with residual policy's deployment frequency
+        super().__init__(*args, deployed_action_steps=residual_deployed_action_steps, **kwargs)
+        
+        # Base policy specific attributes
+        self.base_deployed_action_steps = base_deployed_action_steps
+        self._base_action_buffer = None  # Will store (T_A, A) from base policy
+        self._base_action_idx = 0
+        self.base_policy = None  # Will be set to the base policy from residual_policy.base_policy
+    
+    def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
+        """
+        Coordinated action generation:
+        1. Get base action from buffer (refresh every base_deployed_action_steps)
+        2. Get residual correction from residual policy (every step)
+        3. Combine: final_action = base_action + residual_correction
+        """
+        obs = any_to_torch(obs, device="cpu")
+        obs = self.process_obs(obs=obs)
+        
+        # Maintain observation history
+        if len(self._obs_history) == 0:
+            for _ in range(self.obs_window_size):
+                self._obs_history.append(obs)
+        else:
+            self._obs_history.append(obs)
+        obs_stacked = any_concat(self._obs_history, dim=1)  # (B=1, T_obs, ...)
+
+        # ===== Base Policy: Action Chunking =====
+        need_base_inference = self._base_action_idx % self.base_deployed_action_steps == 0
+        if need_base_inference:
+            # Get base policy from residual policy
+            if self.base_policy is None and hasattr(self.policy, 'base_policy'):
+                self.base_policy = self.policy.base_policy
+            
+            if self.base_policy is not None:
+                # Base policy predicts action chunk
+                self._base_action_buffer = self.base_policy.act(obs_stacked).squeeze(0)  # (T_A, A)
+                self._base_action_idx = 0
+            else:
+                raise ValueError("base_policy not found in residual policy!")
+        
+        # Get current base action from buffer
+        base_action = self._base_action_buffer[self._base_action_idx]  # (A,)
+        self._base_action_idx += 1
+
+        # ===== Residual Policy: Per-step Correction =====
+        # The residual policy expects obs wrapped in {"obs": obs_dict}
+        # We pass the base action through the obs dict
+        # Note: obs_stacked is a dict with structure like {"qpos": ..., "eef": ..., "rgb": ...}
+        obs_for_residual = {"obs": obs_stacked}
+        
+        # Optionally add base action to observations if residual policy needs it as input
+        # (Currently residual policy doesn't use it as input, it will get it from data during training)
+        
+        # Get residual correction (intervention decision + action correction)
+        residual_action, intervention = self.policy.act(obs_for_residual)
+        residual_action = residual_action.squeeze()  # (A,)
+        intervention = intervention.squeeze()  # scalar
+
+        # ===== Combine Actions =====
+        if intervention >= 0.5:  # Intervention needed
+            # Apply residual correction
+            final_action = base_action + residual_action
+        else:
+            # No intervention, use base action as-is
+            final_action = base_action
+
+        return final_action
+
+    def reset(self) -> None:
+        """Reset both policies and their states"""
+        super().reset()
+        self._base_action_buffer = None
+        self._base_action_idx = 0
+        if self.base_policy is not None:
+            self.base_policy.reset()

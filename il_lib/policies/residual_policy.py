@@ -1,13 +1,17 @@
 import os
 import torch
+from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
+from hydra.core.global_hydra import GlobalHydra
+from hydra.core.hydra_config import HydraConfig
 from il_lib.nn.distributions import GMMHead, CategoricalNet
 from il_lib.policies.policy_base import BasePolicy
 from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.optim import CosineScheduleFunction
-from il_lib.utils.training_utils import freeze_params, load_state_dict
+from il_lib.utils.training_utils import freeze_params, load_state_dict, load_torch
+from il_lib.utils.config_utils import register_omegaconf_resolvers
 from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from typing import Any, Dict, List, Optional
 
 
@@ -42,6 +46,10 @@ class ResidualPolicy(BasePolicy):
         update_intervention_head_only: bool = False,
         ckpt_path_if_update_intervention_head_only: Optional[str] = None,
         intervention_loss_weight: float = 1.0,
+        # ====== Base Policy ======
+        base_policy: BasePolicy,
+        base_policy_ckpt_path: str,
+        base_policy_overrides: Optional[List[str]] = None,
         # ====== Learning ======
         lr: float,
         use_cosine_lr: bool = True,
@@ -123,6 +131,54 @@ class ResidualPolicy(BasePolicy):
         self._intervention_loss_weight = intervention_loss_weight
         self._learn_gripper_action = learn_gripper_action
         self._include_robot_gripper_action_input = include_robot_gripper_action_input
+        # load base policy
+        assert base_policy_ckpt_path is not None, "Must provide base_policy_ckpt_path to load base policy weights!"
+        
+        # base_policy is a config name (e.g., "diffusion_rgbd_unet")
+        # Load it using Hydra compose with CLI overrides
+        overrides = [f"arch={base_policy}"]
+        
+        # Get CLI overrides from the current Hydra run, excluding the arch parameter
+        if GlobalHydra.instance().is_initialized():
+            try:
+                hydra_cfg = HydraConfig.get()
+                cli_overrides = [o for o in hydra_cfg.overrides.task if not o.startswith("arch=")]
+                overrides.extend(cli_overrides)
+            except:
+                pass  # If HydraConfig is not available, just use base overrides
+        
+        # Add any additional overrides from base_policy_overrides parameter
+        if base_policy_overrides is not None:
+            overrides.extend(base_policy_overrides)
+        
+        if GlobalHydra.instance().is_initialized():
+            # If Hydra is already initialized, use compose with overrides
+            base_policy_cfg = compose(config_name="base_config", overrides=overrides)
+            base_policy_cfg = base_policy_cfg.module
+        else:
+            # If not initialized, we need to initialize it first
+            config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs")
+            config_dir = os.path.abspath(config_dir)
+            with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
+                base_policy_cfg = compose(config_name="base_config", overrides=overrides)
+                base_policy_cfg = base_policy_cfg.module
+        register_omegaconf_resolvers()
+        OmegaConf.resolve(base_policy_cfg)
+        self.base_policy = instantiate(base_policy_cfg, _recursive_=False)
+        
+        ckpt = load_torch(
+            base_policy_ckpt_path,
+            map_location="cpu",
+        )
+        load_state_dict(
+            self.base_policy,
+            ckpt["state_dict"],
+            strict=True
+        )
+        self.base_policy = self.base_policy.to("cuda")
+        self.base_policy.eval()
+        freeze_params(self.base_policy)
+
         # ====== Learning ======
         self.lr = lr
         self.use_cosine_lr = use_cosine_lr
@@ -146,7 +202,6 @@ class ResidualPolicy(BasePolicy):
         obs["proprioception"] = prop_obs
         obs = {k: obs[k] for k in self._features}  # filter obs to only include features we have
         obs_feature = self.feature_extractor(obs)  # (B, T_O, D)
-        print(obs_feature.shape)
         action_dist = self.action_net(obs_feature)
         intervention_dist = self.intervention_head(obs_feature)
         return action_dist, intervention_dist
@@ -270,6 +325,11 @@ class ResidualPolicy(BasePolicy):
             "intervention_loss": intervention_loss,
             "intervention_acc": intervention_acc,
         }
+        if not is_train:
+            # use the combined loss as a proxy for evaluation
+            log_dict.update({
+                "l1": action_loss + intervention_loss,
+            })
         return loss, log_dict, real_batch_size
     
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
