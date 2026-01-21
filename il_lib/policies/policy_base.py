@@ -292,7 +292,7 @@ class PolicyWrapper:
 
     def process_obs(self, obs: dict) -> dict:
         # Expand twice to get B and T_A dimensions
-        processed_obs = {"qpos": dict(), "eef": dict()}
+        processed_obs = {"qpos": dict()}
         if self._robot_name is None:
             for key in obs:
                 if "proprio" in key:
@@ -330,20 +330,22 @@ class PolicyWrapper:
                     / (JOINT_RANGE[self.robot_type][key][1] - JOINT_RANGE[self.robot_type][key][0])
                     - 1.0
                 )
-        for key in EEF_POSITION_RANGE[self.robot_type]:
-            processed_obs["eef"][f"{key}_pos"] = self._post_processing_fn(
-                2
-                * (
-                    proprio[..., PROPRIOCEPTION_INDICES[self.robot_type][f"eef_{key}_pos"]]
-                    - EEF_POSITION_RANGE[self.robot_type][key][0]
+        if self.robot_type in EEF_POSITION_RANGE:
+            processed_obs["eef"] = dict()
+            for key in EEF_POSITION_RANGE[self.robot_type]:
+                processed_obs["eef"][f"{key}_pos"] = self._post_processing_fn(
+                    2
+                    * (
+                        proprio[..., PROPRIOCEPTION_INDICES[self.robot_type][f"eef_{key}_pos"]]
+                        - EEF_POSITION_RANGE[self.robot_type][key][0]
+                    )
+                    / (EEF_POSITION_RANGE[self.robot_type][key][1] - EEF_POSITION_RANGE[self.robot_type][key][0])
+                    - 1.0
                 )
-                / (EEF_POSITION_RANGE[self.robot_type][key][1] - EEF_POSITION_RANGE[self.robot_type][key][0])
-                - 1.0
-            )
-            # don't normalize the eef orientation
-            processed_obs["eef"][f"{key}_quat"] = self._post_processing_fn(
-                proprio[..., PROPRIOCEPTION_INDICES[self.robot_type][f"eef_{key}_quat"]]
-            )
+                # don't normalize the eef orientation
+                processed_obs["eef"][f"{key}_quat"] = self._post_processing_fn(
+                    proprio[..., PROPRIOCEPTION_INDICES[self.robot_type][f"eef_{key}_quat"]]
+                )
         if "pcd" in self.visual_obs_types:
             pcd_obs = dict()
         for camera_id, camera in ROBOT_CAMERA_NAMES[self.robot_type].items():
