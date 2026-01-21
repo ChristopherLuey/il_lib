@@ -247,13 +247,14 @@ class PolicyWrapper:
         self._task_info_range = (
             torch.tensor(OmegaConf.to_container(task_info_range)) if task_info_range is not None else None
         )
-        # store camera intrinsics
-        self.camera_intrinsics = dict()
-        for camera_id, camera_name in ROBOT_CAMERA_NAMES[self.robot_type].items():
-            scale_factor = 3.0 if camera_id == "head" else 2.0
-            camera_intrinsics = torch.from_numpy(CAMERA_INTRINSICS[self.robot_type][camera_id]) / scale_factor
-            camera_intrinsics[-1, -1] = 1.0  # make it homogeneous
-            self.camera_intrinsics[camera_name] = camera_intrinsics
+        if "pcd" in visual_obs_types:
+            # store camera intrinsics
+            self.camera_intrinsics = dict()
+            for camera_id, camera_name in ROBOT_CAMERA_NAMES[self.robot_type].items():
+                scale_factor = 3.0 if camera_id == "head" else 2.0
+                camera_intrinsics = torch.from_numpy(CAMERA_INTRINSICS[self.robot_type][camera_id]) / scale_factor
+                camera_intrinsics[-1, -1] = 1.0  # make it homogeneous
+                self.camera_intrinsics[camera_name] = camera_intrinsics
         self._pcd_range = tuple(pcd_range) if pcd_range is not None else None
         # action steps for deployed policy
         self.deployed_action_steps = deployed_action_steps
