@@ -2,7 +2,6 @@
 #SBATCH --job-name="train_iiil"
 #SBATCH --account=viscam
 #SBATCH --partition=svl,viscam
-#SBATCH --exclude=svl12,svl13,svl14,svl15
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:titanrtx:8
 #SBATCH --ntasks-per-node=8
