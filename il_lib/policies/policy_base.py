@@ -476,19 +476,16 @@ class ResidualPolicyWrapper(PolicyWrapper):
             else:
                 raise ValueError("base_policy not found in residual policy!")
         
-        # Get current base action from buffer
+        # Get current base action from buffer (raw radians, denormalized by base policy)
         base_action = self._base_action_buffer[self._base_action_idx]  # (A,)
         self._base_action_idx += 1
 
+        # Normalize base action back to [-1, 1] so it matches the residual's training space
+        base_action_normalized = self._normalize_action(base_action.clone())
+
         # ===== Residual Policy: Per-step Correction =====
-        # The residual policy expects obs wrapped in {"obs": obs_dict}
-        # We pass the base action through the obs dict
-        # Note: obs_stacked is a dict with structure like {"qpos": ..., "eef": ..., "rgb": ...}
         obs_for_residual = {"obs": obs_stacked}
-        
-        # Optionally add base action to observations if residual policy needs it as input
-        # (Currently residual policy doesn't use it as input, it will get it from data during training)
-        
+
         # Get residual correction (intervention decision + action correction)
         residual_action, intervention = self.policy.act(obs_for_residual)
         residual_action = residual_action.squeeze()  # (A,)
@@ -496,13 +493,36 @@ class ResidualPolicyWrapper(PolicyWrapper):
 
         # ===== Combine Actions =====
         if intervention >= 0.5:  # Intervention needed
-            # Apply residual correction
-            final_action = base_action + residual_action
+            # Add residual in normalized space, then denormalize
+            combined_normalized = base_action_normalized + residual_action
+            final_action = self._denormalize_action(combined_normalized)
         else:
-            # No intervention, use base action as-is
+            # No intervention, use base action as-is (already denormalized)
             final_action = base_action
 
         return final_action
+
+    def _normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Normalize action from raw joint space to [-1, 1]."""
+        for k, v in ACTION_QPOS_INDICES[self.robot_type].items():
+            if "gripper" not in k:
+                action[..., v] = (
+                    2 * (action[..., v] - JOINT_RANGE[self.robot_type][k][0])
+                    / (JOINT_RANGE[self.robot_type][k][1] - JOINT_RANGE[self.robot_type][k][0])
+                    - 1.0
+                )
+        return action
+
+    def _denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Denormalize action from [-1, 1] to raw joint space."""
+        for k, v in ACTION_QPOS_INDICES[self.robot_type].items():
+            if "gripper" in k:
+                action[..., v] = torch.where(action[..., v] > 0, 1.0, -1.0)
+            else:
+                action[..., v] = (action[..., v] + 1) / 2 * (
+                    JOINT_RANGE[self.robot_type][k][1] - JOINT_RANGE[self.robot_type][k][0]
+                ) + JOINT_RANGE[self.robot_type][k][0]
+        return action
 
     def reset(self) -> None:
         """Reset both policies and their states"""
