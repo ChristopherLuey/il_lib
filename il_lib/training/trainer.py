@@ -134,15 +134,16 @@ class Trainer:
                 pl_loggers.CSVLogger(self.run_dir, name="logs", version=""),
             ]
         if cfg.use_wandb:
-            loggers.append(
-                pl_loggers.WandbLogger(
-                    name=cfg.wandb_run_name,
-                    project=cfg.wandb_project,
-                    group=cfg.wandb_group,
-                    id=self.run_name,
-                    save_dir=self.run_dir,
-                )
-            )
+            wandb_kwargs = {
+                "name": cfg.wandb_run_name,
+                "project": cfg.wandb_project,
+                "group": cfg.wandb_group,
+                "id": self.run_name,
+                "save_dir": self.run_dir,
+            }
+            if "wandb_entity" in cfg:
+                wandb_kwargs["entity"] = cfg.wandb_entity
+            loggers.append(pl_loggers.WandbLogger(**wandb_kwargs))
         return loggers
 
     def create_callbacks(self, cfg) -> List[Callback]:
