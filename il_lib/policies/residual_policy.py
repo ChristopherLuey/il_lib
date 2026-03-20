@@ -131,53 +131,49 @@ class ResidualPolicy(BasePolicy):
         self._intervention_loss_weight = intervention_loss_weight
         self._learn_gripper_action = learn_gripper_action
         self._include_robot_gripper_action_input = include_robot_gripper_action_input
-        # load base policy
-        assert base_policy_ckpt_path is not None, "Must provide base_policy_ckpt_path to load base policy weights!"
         
-        # base_policy is a config name (e.g., "diffusion_rgbd_unet")
-        # Load it using Hydra compose with CLI overrides
-        overrides = [f"arch={base_policy}"]
-        
-        # Get CLI overrides from the current Hydra run, excluding the arch parameter
-        if GlobalHydra.instance().is_initialized():
-            try:
-                hydra_cfg = HydraConfig.get()
-                cli_overrides = [o for o in hydra_cfg.overrides.task if not o.startswith("arch=")]
-                overrides.extend(cli_overrides)
-            except:
-                pass  # If HydraConfig is not available, just use base overrides
-        
-        # Add any additional overrides from base_policy_overrides parameter
-        if base_policy_overrides is not None:
-            overrides.extend(base_policy_overrides)
-        
-        if GlobalHydra.instance().is_initialized():
-            # If Hydra is already initialized, use compose with overrides
-            base_policy_cfg = compose(config_name="base_config", overrides=overrides)
-            base_policy_cfg = base_policy_cfg.module
-        else:
-            # If not initialized, we need to initialize it first
-            config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs")
-            config_dir = os.path.abspath(config_dir)
-            with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
+        self._base_policy = None
+        if base_policy_ckpt_path is not None:
+            assert base_policy is not None, "Must provide base_policy config name when base_policy_ckpt_path is provided!"
+            
+            overrides = [f"arch={base_policy}"]
+            
+            if GlobalHydra.instance().is_initialized():
+                try:
+                    hydra_cfg = HydraConfig.get()
+                    cli_overrides = [o for o in hydra_cfg.overrides.task if not o.startswith("arch=")]
+                    overrides.extend(cli_overrides)
+                except:
+                    pass
+            
+            if base_policy_overrides is not None:
+                overrides.extend(base_policy_overrides)
+            
+            if GlobalHydra.instance().is_initialized():
                 base_policy_cfg = compose(config_name="base_config", overrides=overrides)
                 base_policy_cfg = base_policy_cfg.module
-        register_omegaconf_resolvers()
-        OmegaConf.resolve(base_policy_cfg)
-        self.base_policy = instantiate(base_policy_cfg, _recursive_=False)
-        
-        ckpt = load_torch(
-            base_policy_ckpt_path,
-            map_location="cpu",
-        )
-        load_state_dict(
-            self.base_policy,
-            ckpt["state_dict"],
-            strict=True
-        )
-        self.base_policy = self.base_policy.to("cuda")
-        self.base_policy.eval()
-        freeze_params(self.base_policy)
+            else:
+                config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs")
+                config_dir = os.path.abspath(config_dir)
+                with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
+                    base_policy_cfg = compose(config_name="base_config", overrides=overrides)
+                    base_policy_cfg = base_policy_cfg.module
+            register_omegaconf_resolvers()
+            OmegaConf.resolve(base_policy_cfg)
+            self._base_policy = instantiate(base_policy_cfg, _recursive_=False)
+            
+            ckpt = load_torch(
+                base_policy_ckpt_path,
+                map_location="cpu",
+            )
+            load_state_dict(
+                self._base_policy,
+                ckpt["state_dict"],
+                strict=True
+            )
+            self._base_policy = self._base_policy.to("cuda")
+            self._base_policy.eval()
+            freeze_params(self._base_policy)
 
         # ====== Learning ======
         self.lr = lr
@@ -208,13 +204,22 @@ class ResidualPolicy(BasePolicy):
 
     @torch.no_grad()
     def act(self, obs, deterministic=None):
-        action_dist, intervention_dist = self.forward(obs)
         if deterministic is None:
             deterministic = self._deterministic_inference
+        
+        residual_action_dist, intervention_dist = self.forward(obs)
         if deterministic:
-            return action_dist.mode(), intervention_dist.mode()
+            residual_action = residual_action_dist.mode()
+            intervention = intervention_dist.mode()
         else:
-            return action_dist.sample(), intervention_dist.sample()
+            residual_action = residual_action_dist.sample()
+            intervention = intervention_dist.sample()
+        
+        assert self._base_policy is not None, "base_policy_ckpt_path must be provided for inference!"
+        base_action = self._base_policy.act(obs, deterministic=deterministic)
+        final_action = base_action + residual_action
+        
+        return final_action, intervention
 
     def reset(self) -> None:
         pass
