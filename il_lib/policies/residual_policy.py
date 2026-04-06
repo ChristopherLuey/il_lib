@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
@@ -39,6 +40,7 @@ class ResidualPolicy(BasePolicy):
         # ====== Intervention ======
         learn_gripper_action: bool = True,
         include_robot_gripper_action_input: bool = True,
+        use_intervention_head: bool = True,
         intervention_head_hidden_dim: int,
         intervention_head_hidden_depth: int,
         intervention_head_activation: str = "relu",
@@ -46,6 +48,9 @@ class ResidualPolicy(BasePolicy):
         update_intervention_head_only: bool = False,
         ckpt_path_if_update_intervention_head_only: Optional[str] = None,
         intervention_loss_weight: float = 1.0,
+        supervise_zero_residual_off_intervention: bool = False,
+        zero_residual_loss_weight: float = 1.0,
+        off_intervention_residual_l1_weight: float = 0.0,
         # ====== Base Policy ======
         base_policy: BasePolicy,
         base_policy_ckpt_path: str,
@@ -88,14 +93,19 @@ class ResidualPolicy(BasePolicy):
             activation=action_net_activation,
             low_noise_eval=gmm_low_noise_eval,
         )
-        self.intervention_head = CategoricalNet(
-            feature_fusion_output_dim,
-            action_dim=2,  # intervention or not
-            hidden_dim=intervention_head_hidden_dim,
-            hidden_depth=intervention_head_hidden_depth,
-            activation=intervention_head_activation,
-        )
+        self._use_intervention_head = use_intervention_head
+        if self._use_intervention_head:
+            self.intervention_head = CategoricalNet(
+                feature_fusion_output_dim,
+                action_dim=2,  # intervention or not
+                hidden_dim=intervention_head_hidden_dim,
+                hidden_depth=intervention_head_hidden_depth,
+                activation=intervention_head_activation,
+            )
+        else:
+            self.intervention_head = None
         if update_intervention_head_only:
+            assert self._use_intervention_head, "update_intervention_head_only requires use_intervention_head=true"
             assert os.path.exists(ckpt_path_if_update_intervention_head_only)
             ckpt = torch.load(
                 ckpt_path_if_update_intervention_head_only, map_location="cpu"
@@ -129,6 +139,9 @@ class ResidualPolicy(BasePolicy):
 
         self._deterministic_inference = deterministic_inference
         self._intervention_loss_weight = intervention_loss_weight
+        self._supervise_zero_residual_off_intervention = supervise_zero_residual_off_intervention
+        self._zero_residual_loss_weight = zero_residual_loss_weight
+        self._off_intervention_residual_l1_weight = off_intervention_residual_l1_weight
         self._learn_gripper_action = learn_gripper_action
         self._include_robot_gripper_action_input = include_robot_gripper_action_input
         # load base policy
@@ -139,13 +152,43 @@ class ResidualPolicy(BasePolicy):
         overrides = [f"arch={base_policy}"]
         
         # Get CLI overrides from the current Hydra run, excluding the arch parameter
+        # and any residual-module-specific overrides that should not leak into the
+        # nested base-policy compose.
+        def _skip_nested_module_override(override: str) -> bool:
+            return (
+                override.startswith("module.")
+                or override.startswith("+module.")
+                or override.startswith("++module.")
+            )
+
+        cli_overrides = []
         if GlobalHydra.instance().is_initialized():
             try:
                 hydra_cfg = HydraConfig.get()
-                cli_overrides = [o for o in hydra_cfg.overrides.task if not o.startswith("arch=")]
-                overrides.extend(cli_overrides)
-            except:
-                pass  # If HydraConfig is not available, just use base overrides
+                cli_overrides = [
+                    o for o in hydra_cfg.overrides.task
+                    if not o.startswith("arch=")
+                    and not _skip_nested_module_override(o)
+                ]
+            except Exception:
+                cli_overrides = []
+
+        # In serve/eval mode HydraConfig may be incomplete here. Fall back to the
+        # original CLI so the nested base-policy compose still sees robot/task.
+        if (
+            not any(o.startswith("robot=") for o in cli_overrides)
+            or not any(o.startswith("task=") for o in cli_overrides)
+        ):
+            argv_overrides = [
+                o for o in sys.argv[1:]
+                if not o.startswith("arch=")
+                and not _skip_nested_module_override(o)
+            ]
+            for override in argv_overrides:
+                if override not in cli_overrides:
+                    cli_overrides.append(override)
+
+        overrides.extend(cli_overrides)
         
         # Add any additional overrides from base_policy_overrides parameter
         if base_policy_overrides is not None:
@@ -203,18 +246,36 @@ class ResidualPolicy(BasePolicy):
         obs = {k: obs[k] for k in self._features}  # filter obs to only include features we have
         obs_feature = self.feature_extractor(obs)  # (B, T_O, D)
         action_dist = self.action_net(obs_feature)
-        intervention_dist = self.intervention_head(obs_feature)
+        intervention_dist = self.intervention_head(obs_feature) if self._use_intervention_head else None
         return action_dist, intervention_dist
 
     @torch.no_grad()
-    def act(self, obs, deterministic=None):
+    def act_bundle(self, obs, deterministic=None):
         action_dist, intervention_dist = self.forward(obs)
         if deterministic is None:
             deterministic = self._deterministic_inference
-        if deterministic:
-            return action_dist.mode(), intervention_dist.mode()
+
+        residual_action = action_dist.mode() if deterministic else action_dist.sample()
+        if intervention_dist is None:
+            intervention = torch.ones(
+                residual_action.shape[:-1],
+                device=residual_action.device,
+                dtype=torch.long,
+            )
+            intervention_weight = torch.ones(
+                residual_action.shape[:-1],
+                device=residual_action.device,
+                dtype=residual_action.dtype,
+            )
         else:
-            return action_dist.sample(), intervention_dist.sample()
+            intervention = intervention_dist.mode() if deterministic else intervention_dist.sample()
+            intervention_weight = intervention_dist.probs[..., 1]
+        return residual_action, intervention, intervention_weight
+
+    @torch.no_grad()
+    def act(self, obs, deterministic=None):
+        residual_action, intervention, _ = self.act_bundle(obs, deterministic=deterministic)
+        return residual_action, intervention
 
     def reset(self) -> None:
         pass
@@ -269,8 +330,8 @@ class ResidualPolicy(BasePolicy):
 
         pad_mask = batch.pop("masks")
         intervention_mask = batch.pop("int_state") == 2  # intervention happened
-        # only valid when both intervention and pad mask are True
         action_valid_mask = intervention_mask & pad_mask
+        non_intervention_mask = (~intervention_mask) & pad_mask
         # get residual action target
         robot_policy_action = batch["base_action"]
         oracle_action = batch["oracle_action"]
@@ -300,6 +361,13 @@ class ResidualPolicy(BasePolicy):
             target_action = torch.cat([residual_q, residual_gripper], dim=-1)
         else:
             target_action = residual_q
+        if self._supervise_zero_residual_off_intervention:
+            target_action = torch.where(
+                intervention_mask.unsqueeze(-1),
+                target_action,
+                torch.zeros_like(target_action),
+            )
+            action_valid_mask = pad_mask
         if self._include_robot_gripper_action_input:
             batch["robot_policy_gripper_action"] = robot_policy_gripper_action
         # forward pass
@@ -307,23 +375,62 @@ class ResidualPolicy(BasePolicy):
         raw_action_loss = pi.imitation_loss(
             target_action, reduction="none"
         ).reshape(action_valid_mask.shape)
-        action_loss = raw_action_loss * action_valid_mask
-        raw_intervention_loss = intervention_dist.imitation_loss(
-            intervention_mask.long(), reduction="none"
-        ).reshape(pad_mask.shape)
-        intervention_loss = raw_intervention_loss * pad_mask
-        intervention_acc = intervention_dist.imitation_accuracy(
-            intervention_mask.long(),
-            mask=pad_mask,
+        intervention_action_loss = raw_action_loss * (intervention_mask & pad_mask)
+        non_intervention_action_loss = raw_action_loss * non_intervention_mask
+        raw_non_intervention_residual_l1 = (
+            -pi.imitation_accuracy(
+                torch.zeros_like(target_action),
+                reduction="none",
+            ).reshape(pad_mask.shape)
         )
+        non_intervention_residual_l1 = raw_non_intervention_residual_l1 * non_intervention_mask
+        if intervention_dist is not None:
+            raw_intervention_loss = intervention_dist.imitation_loss(
+                intervention_mask.long(), reduction="none"
+            ).reshape(pad_mask.shape)
+            intervention_loss = raw_intervention_loss * pad_mask
+            intervention_acc = intervention_dist.imitation_accuracy(
+                intervention_mask.long(),
+                mask=pad_mask,
+            )
+        else:
+            intervention_loss = torch.zeros_like(raw_action_loss)
+            intervention_acc = torch.ones((), device=target_action.device, dtype=target_action.dtype)
+        intervention_steps = (intervention_mask & pad_mask).sum()
+        non_intervention_steps = non_intervention_mask.sum()
         real_batch_size = action_valid_mask.sum()
-        action_loss = torch.sum(action_loss) / real_batch_size
+        intervention_action_loss = torch.sum(intervention_action_loss) / intervention_steps.clamp_min(1)
+        non_intervention_residual_l1 = (
+            torch.sum(non_intervention_residual_l1) / non_intervention_steps.clamp_min(1)
+        )
+        if self._supervise_zero_residual_off_intervention:
+            non_intervention_action_loss = (
+                torch.sum(non_intervention_action_loss) / non_intervention_steps.clamp_min(1)
+            )
+            loss_weight_denom = 1.0 + (
+                self._zero_residual_loss_weight if non_intervention_steps.item() > 0 else 0.0
+            )
+            action_loss = (
+                intervention_action_loss
+                + self._zero_residual_loss_weight * non_intervention_action_loss
+            ) / loss_weight_denom
+        else:
+            non_intervention_action_loss = torch.zeros_like(intervention_action_loss)
+            action_loss = intervention_action_loss
         intervention_loss = (torch.sum(intervention_loss) / pad_mask.sum())
-        loss = action_loss + self._intervention_loss_weight * intervention_loss
+        loss = (
+            action_loss
+            + self._intervention_loss_weight * intervention_loss
+            + self._off_intervention_residual_l1_weight * non_intervention_residual_l1
+        )
         log_dict = {
             "action_loss": action_loss,
+            "intervention_action_loss": intervention_action_loss,
+            "non_intervention_action_loss": non_intervention_action_loss,
+            "non_intervention_residual_l1": non_intervention_residual_l1,
             "intervention_loss": intervention_loss,
             "intervention_acc": intervention_acc,
+            "intervention_rate": intervention_steps.float() / pad_mask.sum().clamp_min(1),
         }
         if not is_train:
             # use the combined loss as a proxy for evaluation

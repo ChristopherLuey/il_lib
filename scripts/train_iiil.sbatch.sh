@@ -29,6 +29,9 @@ echo "Running with args: $@"
 source /vision/u/wsai/miniconda3/bin/activate behavior
 
 export NCCL_IB_DISABLE=1
+# PyTorch 2.6+ defaults torch.load(..., weights_only=True), which breaks
+# Lightning full-state resume for older checkpoints that include optimizer state.
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
 
 srun python train.py gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES "$@"
 
