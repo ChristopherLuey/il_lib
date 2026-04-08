@@ -77,9 +77,16 @@ class SimpleResidualPolicy(BasePolicy):
         lr_cosine_min: Optional[float] = None,
         optimizer: str = "adam",
         weight_decay: float = 0.0,
+        lr_layer_decay: float = 1.0,
+        # ====== Two-Stage Training ======
+        stage2_ckpt_path: Optional[str] = None,  # If set, freeze backbone+action, train intervention only
+        dropout: float = 0.0,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        # Filter out kwargs that LightningModule doesn't accept
+        _allowed = {"online_eval", "policy_wrapper", "robot_type"}
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in _allowed}
+        super().__init__(*args, **filtered_kwargs)
 
         self._prop_dim = prop_dim
         self._prop_keys = prop_keys
@@ -141,6 +148,24 @@ class SimpleResidualPolicy(BasePolicy):
         self.lr_cosine_min = lr_cosine_min
         self.optimizer_name = optimizer
         self.weight_decay = weight_decay
+
+        # Stage 2: load stage 1 checkpoint, freeze backbone + action head, train intervention only
+        self._stage2 = stage2_ckpt_path is not None
+        if self._stage2:
+            assert use_intervention_head, "Stage 2 requires use_intervention_head=true"
+            print(f"[SimpleResidualPolicy] Stage 2: loading backbone from {stage2_ckpt_path}")
+            ckpt = load_torch(stage2_ckpt_path, map_location="cpu")
+            # Load everything except intervention head
+            state = ckpt["state_dict"]
+            own_state = self.state_dict()
+            for k, v in state.items():
+                if k in own_state and "intervention_head" not in k and "base_policy" not in k:
+                    own_state[k] = v
+            self.load_state_dict(own_state, strict=False)
+            # Freeze feature extractor + action net
+            freeze_params(self.feature_extractor)
+            freeze_params(self.action_net)
+            print(f"[SimpleResidualPolicy] Frozen: feature_extractor, action_net. Training: intervention_head only.")
 
     def _load_base_policy(self, base_policy_name: str, ckpt_path: str, extra_overrides: Optional[List[str]] = None):
         """Load and freeze the base policy."""
