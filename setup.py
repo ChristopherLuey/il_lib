@@ -1,5 +1,4 @@
 import pathlib
-import pkg_resources
 from setuptools import setup, find_packages
 
 
@@ -16,7 +15,7 @@ def _read_file(fname):
 def _read_install_requires():
     with pathlib.Path("requirements.txt").open() as fp:
         return [
-            str(requirement) for requirement in pkg_resources.parse_requirements(fp)
+            line.strip() for line in fp if line.strip() and not line.startswith("#")
         ]
 
 
@@ -40,13 +39,13 @@ setup(
     zip_safe=False,
     entry_points={
         "console_scripts": [],
-        'hydra.plugins.search_path': [
-            'search_path_plugin = il_lib.hydra_plugins.search_path_plugin:SearchPathPlugin'
-        ]
+        "hydra.plugins.search_path": [
+            "search_path_plugin = il_lib.hydra_plugins.search_path_plugin:SearchPathPlugin"
+        ],
     },
     install_requires=_read_install_requires(),
     extras_require=_fill_extras(EXTRAS),
-    #python_requires=">=3.9",
+    python_requires=">=3.10",
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
