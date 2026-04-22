@@ -94,16 +94,16 @@ class DiffusionPolicy(BasePolicy):
         self.lr_layer_decay = lr_layer_decay
         self.optimizer = optimizer
         self.weight_decay = weight_decay
+        self._cached_obs_feature = None
         # Save hyperparameters
         self.save_hyperparameters()
 
-    def forward(self, obs, noisy_traj, diffusion_timesteps):
+    def encode_obs(self, obs: dict) -> torch.Tensor:
+        """Extract observation embedding from raw obs dict.
+
+        Returns:
+            obs_feature: (B, T_O, D)
         """
-        obs: dict of (B, L, ...), where L = num_latest_obs
-        noisy_traj: (B, L, ...), where L = horizon
-        diffusion_timesteps: (B,)
-        """
-        # construct prop obs
         prop_obs = []
         for prop_key in self._prop_keys:
             if "/" in prop_key:
@@ -113,9 +113,19 @@ class DiffusionPolicy(BasePolicy):
                 prop_obs.append(obs[prop_key])
         prop_obs = torch.cat(prop_obs, dim=-1)  # (B, L, Prop_dim)
         obs["proprioception"] = prop_obs
-        obs = {k: obs[k] for k in self._features}  # filter obs to only include features we have
-        self._check_forward_input_shape(obs, noisy_traj, diffusion_timesteps)
-        obs_feature = self.feature_extractor(obs)  # (B, T_O, D)
+        obs = {k: obs[k] for k in self._features}
+        return self.feature_extractor(obs)  # (B, T_O, D)
+
+    def forward(self, obs, noisy_traj, diffusion_timesteps, obs_feature=None):
+        """
+        obs: dict of (B, L, ...), where L = num_latest_obs
+        noisy_traj: (B, L, ...), where L = horizon
+        diffusion_timesteps: (B,)
+        obs_feature: optional precomputed (B, T_O, D) to skip re-encoding
+        """
+        if obs_feature is None:
+            obs_feature = self.encode_obs(obs)
+        self._check_forward_input_shape_from_feature(obs_feature, noisy_traj, diffusion_timesteps)
 
         pred = self.backbone(
             sample=noisy_traj,
@@ -137,8 +147,11 @@ class DiffusionPolicy(BasePolicy):
         scheduler = self.noise_scheduler
         scheduler.set_timesteps(self.num_denoise_steps_per_inference)
 
+        obs_feature = self.encode_obs(obs)
+        self._cached_obs_feature = obs_feature
+
         for t in scheduler.timesteps:
-            pred = self.forward(obs, noisy_traj, t)
+            pred = self.forward(obs, noisy_traj, t, obs_feature=obs_feature)
             # denosing
             noisy_traj = scheduler.step(
                 pred, t, noisy_traj, **self.noise_scheduler_step_kwargs
@@ -151,18 +164,17 @@ class DiffusionPolicy(BasePolicy):
         pass
     
     @call_once
-    def _check_forward_input_shape(self, obs, noisy_traj, diffusion_timesteps):
-        L_obs = get_batch_size(any_slice(obs, 0), strict=True)
+    def _check_forward_input_shape_from_feature(self, obs_feature, noisy_traj, diffusion_timesteps):
+        L_obs = obs_feature.shape[1]
         assert (
             L_obs == self.num_latest_obs
         ), f"obs must have length {self.num_latest_obs}"
         L_traj = get_batch_size(any_slice(noisy_traj, 0), strict=True)
         assert L_traj == self.horizon, f"noisy_traj must have length {self.horizon}"
 
-        B_obs = get_batch_size(obs, strict=True)
+        B_obs = obs_feature.shape[0]
         B_traj = get_batch_size(noisy_traj, strict=True)
         if diffusion_timesteps.ndim == 0:
-            # for inference
             assert B_obs == B_traj, "Batch size must match"
         else:
             B_t = get_batch_size(diffusion_timesteps, strict=True)

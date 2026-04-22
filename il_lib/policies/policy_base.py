@@ -266,6 +266,13 @@ class PolicyWrapper:
         self._action_idx = 0
         self._robot_name = None
         self.joint_range = JOINT_RANGE[self.robot_type]
+        self._cached_obs_embedding = None
+
+    @property
+    def last_obs_embedding(self):
+        if self._cached_obs_embedding is None:
+            return None
+        return self._cached_obs_embedding.detach().cpu().numpy()
 
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
         obs = any_to_torch(obs, device="cpu")
@@ -280,6 +287,7 @@ class PolicyWrapper:
         need_inference = self._action_idx % self.deployed_action_steps == 0
         if need_inference:
             self._action_traj_pred = self.policy.act({"obs": obs}).squeeze(0)  # (T_A, A)
+            self._cached_obs_embedding = getattr(self.policy, '_cached_obs_feature', None)
             self._action_idx = 0
         action = self._action_traj_pred[self._action_idx]
         self._action_idx += 1
@@ -291,6 +299,7 @@ class PolicyWrapper:
         self._obs_history = deque(maxlen=self.obs_window_size)
         self._action_traj_pred = None
         self._action_idx = 0
+        self._cached_obs_embedding = None
 
     def process_obs(self, obs: dict) -> dict:
         # Expand twice to get B and T_A dimensions
