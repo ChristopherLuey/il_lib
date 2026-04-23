@@ -12,7 +12,7 @@ import time
 import traceback
 import websockets
 from copy import deepcopy
-from msgpack import Packer, unpackb
+from omnigibson.learning.utils.network_utils import Packer, unpackb
 from omnigibson.macros import gm
 
 import logging
