@@ -80,6 +80,8 @@ class SimpleResidualPolicy(BasePolicy):
         lr_layer_decay: float = 1.0,
         # ====== Two-Stage Training ======
         stage2_ckpt_path: Optional[str] = None,  # If set, freeze backbone+action, train intervention only
+        freeze_action_head: bool = False,  # Train intervention head only (reversed stage 1)
+        reversed_stage2_ckpt_path: Optional[str] = None,  # Load ckpt, freeze backbone+intervention, train action only
         dropout: float = 0.0,
         **kwargs,
     ):
@@ -166,6 +168,29 @@ class SimpleResidualPolicy(BasePolicy):
             freeze_params(self.feature_extractor)
             freeze_params(self.action_net)
             print(f"[SimpleResidualPolicy] Frozen: feature_extractor, action_net. Training: intervention_head only.")
+
+        # Reversed stage 1: freeze action head, train backbone + intervention head
+        self._freeze_action_head = freeze_action_head
+        if freeze_action_head:
+            assert use_intervention_head, "freeze_action_head requires use_intervention_head=true"
+            freeze_params(self.action_net)
+            print(f"[SimpleResidualPolicy] Reversed stage 1: frozen action_net. Training: feature_extractor + intervention_head.")
+
+        # Reversed stage 2: load ckpt with trained intervention head, freeze it + backbone, train action only
+        self._reversed_stage2 = reversed_stage2_ckpt_path is not None
+        if self._reversed_stage2:
+            print(f"[SimpleResidualPolicy] Reversed stage 2: loading from {reversed_stage2_ckpt_path}")
+            ckpt = load_torch(reversed_stage2_ckpt_path, map_location="cpu")
+            state = ckpt["state_dict"]
+            own_state = self.state_dict()
+            for k, v in state.items():
+                if k in own_state and "action_net" not in k and "base_policy" not in k:
+                    own_state[k] = v
+            self.load_state_dict(own_state, strict=False)
+            freeze_params(self.feature_extractor)
+            if self.intervention_head is not None:
+                freeze_params(self.intervention_head)
+            print(f"[SimpleResidualPolicy] Frozen: feature_extractor, intervention_head. Training: action_net only.")
 
     def _load_base_policy(self, base_policy_name: str, ckpt_path: str, extra_overrides: Optional[List[str]] = None):
         """Load and freeze the base policy."""
