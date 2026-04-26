@@ -577,9 +577,12 @@ class ResidualPolicyWrapper(PolicyWrapper):
         return final_action
 
     def _build_residual_obs(self, obs_stacked: dict, base_action_normalized: torch.Tensor) -> dict:
+        # base_action is (A,); expand to (1, T, A) to match obs time dimension
+        T = getattr(self.policy, "num_latest_obs", 1)
+        base_action_obs = base_action_normalized.unsqueeze(0).unsqueeze(0).expand(-1, T, -1)
         obs_for_residual = {
             "qpos": obs_stacked["qpos"],
-            "base_action": base_action_normalized.unsqueeze(0).unsqueeze(0),
+            "base_action": base_action_obs,
         }
         if "eef" in obs_stacked:
             obs_for_residual["eef"] = obs_stacked["eef"]
