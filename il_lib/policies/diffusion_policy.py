@@ -195,6 +195,11 @@ class DiffusionPolicy(BasePolicy):
         )
         action_loss = F.mse_loss(pred, noise, reduction="none")  # (B, L, A)
         action_loss = action_loss.mean(dim=-1).reshape(pad_mask.shape)  # (B, L)
+        # apply per-step sample weights if provided (residual-magnitude weighting)
+        sample_weights = batch.pop("sample_weights", None)
+        if sample_weights is not None:
+            sample_weights = sample_weights.reshape(pad_mask.shape)
+            action_loss = action_loss * sample_weights
         # reduce the loss according to the action mask
         # "True" indicates should calculate the loss
         action_loss = action_loss * pad_mask
@@ -328,4 +333,6 @@ class DiffusionPolicy(BasePolicy):
                 "actions": data_batch["actions"],
                 "masks": data_batch["masks"],
             })
+            if "sample_weights" in data_batch:
+                data["sample_weights"] = data_batch["sample_weights"]
         return data
