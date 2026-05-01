@@ -14,53 +14,53 @@ def main():
     # Initialize Hydra with logging disabled for serve mode
     config_dir = os.path.join(os.path.dirname(__file__), "il_lib/configs")
     config_dir = os.path.abspath(config_dir)
-    port = int(os.environ.get("IL_LIB_WEBSOCKET_PORT", "8000"))
-    print(f"[serve.py] target websocket port={port}", flush=True)
     
+    # Also add iiil and OmniGibson config search paths (mirroring the SearchPathPlugin
+    # which is not loaded when using initialize_config_dir)
+    import omnigibson as og
+    extra_search_paths = [f"file://{og.__path__[0]}/learning/configs"]
+    try:
+        import iiil as _iiil
+        extra_search_paths.append(f"file://{_iiil.__path__[0]}/configs")
+    except ImportError:
+        pass
+    search_path_overrides = [
+        f"hydra.searchpath=[{','.join(extra_search_paths)}]"
+    ]
+
     with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
         # Compose config with Hydra logging disabled
-        print("[serve.py] composing config", flush=True)
-        overrides = sys.argv[1:] + [
+        overrides = sys.argv[1:] + search_path_overrides + [
             "hydra.output_subdir=null",
             "hydra.run.dir=.",
             "hydra/job_logging=none",
             "hydra/hydra_logging=none"
         ]
         cfg = compose(config_name="base_config", overrides=overrides)
-        print("[serve.py] config composed", flush=True)
         
         register_omegaconf_resolvers()
         OmegaConf.resolve(cfg)
         OmegaConf.set_struct(cfg, False)
-        print("[serve.py] instantiating module", flush=True)
         policy = instantiate(cfg.module, _recursive_=False)
-        print("[serve.py] module instantiated", flush=True)
-        print(f"[serve.py] loading checkpoint {cfg.ckpt_path}", flush=True)
         ckpt = load_torch(
             cfg.ckpt_path,
             map_location="cpu",
         )
-        print("[serve.py] checkpoint loaded", flush=True)
         load_state_dict(
             policy,
             ckpt["state_dict"],
             strict=True
         )
-        print("[serve.py] state dict loaded", flush=True)
         policy = policy.to("cuda")
-        print("[serve.py] module moved to cuda", flush=True)
         policy.eval()
         # instantiate wrapper for policy
-        print("[serve.py] instantiating policy wrapper", flush=True)
         policy_wrapper = instantiate(cfg.policy_wrapper)
         policy_wrapper.policy = policy
-        print("[serve.py] policy wrapper ready", flush=True)
         server = WebsocketPolicyServer(
             policy=policy_wrapper,
             host="0.0.0.0",
-            port=port,
+            port=8000,
         )
-        print("[serve.py] entering serve_forever", flush=True)
         server.serve_forever()
 
 
