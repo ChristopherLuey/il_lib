@@ -74,6 +74,7 @@ data:
   ctx_len: ${horizon}
   downsample_factor: 3 # downsample to 10Hz
   use_task_info: false
+  action_history_len: 1
   task_info_range: ${task.task_info_range}
   multi_view_cameras: ${robot.multi_view_cameras}
 

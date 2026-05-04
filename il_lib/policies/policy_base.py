@@ -433,12 +433,20 @@ class ResidualPolicyWrapper(PolicyWrapper):
         *args,
         base_deployed_action_steps: int,  # Base policy's action chunk size
         residual_deployed_action_steps: int = 1,  # Residual policy's action step (usually 1)
+        action_history_len: int = 1,
+        gate_threshold: float = 0.5,
+        residual_scale: float = 1.0,
         **kwargs,
     ) -> None:
         # Remove deployed_action_steps from kwargs if present to avoid duplicate
         kwargs.pop("deployed_action_steps", None)
         # Initialize parent with residual policy's deployment frequency
         super().__init__(*args, deployed_action_steps=residual_deployed_action_steps, **kwargs)
+        self._action_history_len = action_history_len
+        self._base_action_history = deque(maxlen=action_history_len)
+        self._gate_threshold = gate_threshold
+        self._residual_scale = residual_scale
+        self._oracle_blend_alpha = kwargs.pop("oracle_blend_alpha", 1.0)
         
         # Base policy specific attributes
         self.base_deployed_action_steps = base_deployed_action_steps
@@ -447,6 +455,18 @@ class ResidualPolicyWrapper(PolicyWrapper):
         self.base_policy = None  # Will be set to the base policy from residual_policy.base_policy
         self._base_obs_history = None  # Separate obs history for base policy
         self._base_obs_window_size = None
+        # Per-step stats tracking for eval reporting
+        self._stats = {
+            "interventions": 0,
+            "total_steps": 0,
+            "residual_mags": [],
+            "gate_decisions": [],       # 1=intervened, 0=passthrough
+            "residual_norms": [],       # L2 norm of residual per step
+            "base_action_norms": [],    # L2 norm of base action per step
+        }
+        # Per-step action vectors for detailed analysis
+        self._episode_traces = []   # list of per-episode dicts
+        self._current_episode = None
     
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
         """
@@ -489,6 +509,8 @@ class ResidualPolicyWrapper(PolicyWrapper):
             base_obs_stacked = any_concat(self._base_obs_history, dim=1)
             self._base_action_buffer = self.base_policy.act({"obs": base_obs_stacked}).squeeze(0)
             self._base_action_idx = 0
+            if hasattr(self.base_policy, '_last_obs_embedding'):
+                self._base_obs_embedding = self.base_policy._last_obs_embedding
         
         # Get current base action from buffer (raw radians, denormalized by base policy)
         base_action = self._base_action_buffer[self._base_action_idx]  # (A,)
@@ -497,8 +519,19 @@ class ResidualPolicyWrapper(PolicyWrapper):
         # Normalize base action back to [-1, 1] so it matches the residual's training space
         base_action_normalized = self._normalize_action(base_action.clone())
 
+        # Maintain action history for temporal context
+        self._base_action_history.append(base_action_normalized.clone())
+        while len(self._base_action_history) < self._action_history_len:
+            self._base_action_history.appendleft(self._base_action_history[0])
+
         # ===== Residual Policy: Per-step Correction =====
-        obs_for_residual = {"obs": obs_stacked, "base_action": base_action_normalized.unsqueeze(0).unsqueeze(0)}
+        if self._action_history_len > 1:
+            action_hist_flat = torch.cat(list(self._base_action_history), dim=-1)
+            obs_for_residual = {"obs": obs_stacked, "base_action": action_hist_flat.unsqueeze(0).unsqueeze(0)}
+        else:
+            obs_for_residual = {"obs": obs_stacked, "base_action": base_action_normalized.unsqueeze(0).unsqueeze(0)}
+        if hasattr(self, '_base_obs_embedding') and self._base_obs_embedding is not None:
+            obs_for_residual["base_embedding"] = self._base_obs_embedding
 
         # Get residual correction (intervention decision + action correction)
         result = self.policy.act(obs_for_residual)
@@ -509,15 +542,41 @@ class ResidualPolicyWrapper(PolicyWrapper):
             residual_action = result.squeeze().cpu()
             intervention = torch.tensor(1.0)
 
-        if intervention >= 0.5:
+        intervened = intervention >= self._gate_threshold
+        if intervened:
             predict_oracle = getattr(self.policy, '_predict_oracle_action', False)
             if predict_oracle:
-                final_action = self._denormalize_action(residual_action)
+                # Use MLP arm prediction but keep base gripper
+                oracle_pred = residual_action.clone()
+                oracle_pred[..., -1] = base_action_normalized[..., -1]
+                # Blend: mix oracle prediction with base using oracle_blend_alpha
+                alpha = self._oracle_blend_alpha
+                blended = alpha * oracle_pred + (1 - alpha) * base_action_normalized
+                blended[..., -1] = base_action_normalized[..., -1]  # always keep base gripper
+                final_action = self._denormalize_action(blended)
             else:
-                combined_normalized = base_action_normalized + residual_action
+                scaled_residual = residual_action * self._residual_scale
+                combined_normalized = base_action_normalized + scaled_residual
                 final_action = self._denormalize_action(combined_normalized)
         else:
             final_action = base_action
+
+        # Track per-step stats
+        self._stats["total_steps"] += 1
+        if intervened:
+            self._stats["interventions"] += 1
+        self._stats["gate_decisions"].append(1 if intervened else 0)
+        self._stats["residual_mags"].append(float(residual_action.abs().mean()))
+        self._stats["residual_norms"].append(float(residual_action.norm()))
+        self._stats["base_action_norms"].append(float(base_action_normalized.norm()))
+
+        # Log per-step action vectors
+        if self._current_episode is None:
+            self._current_episode = {"base": [], "residual": [], "final": [], "gate": []}
+        self._current_episode["base"].append(base_action.detach().cpu().numpy().tolist())
+        self._current_episode["residual"].append(residual_action.detach().cpu().numpy().tolist())
+        self._current_episode["final"].append(final_action.detach().cpu().numpy().tolist())
+        self._current_episode["gate"].append(1 if intervened else 0)
 
         return final_action
 
@@ -543,11 +602,68 @@ class ResidualPolicyWrapper(PolicyWrapper):
                 ) + JOINT_RANGE[self.robot_type][k][0]
         return action
 
+    def get_eval_stats(self):
+        """Return summary stats from inference run."""
+        import numpy as np
+        total = self._stats["total_steps"]
+        ints = self._stats["interventions"]
+        mags = np.array(self._stats["residual_mags"]) if self._stats["residual_mags"] else np.array([0.0])
+        norms = np.array(self._stats["residual_norms"]) if self._stats["residual_norms"] else np.array([0.0])
+        gates = np.array(self._stats["gate_decisions"]) if self._stats["gate_decisions"] else np.array([0])
+        base_norms = np.array(self._stats["base_action_norms"]) if self._stats["base_action_norms"] else np.array([0.0])
+
+        # Split residual stats by gate decision
+        intervened_mask = gates == 1
+        passthrough_mask = gates == 0
+
+        stats = {
+            "total_steps": total,
+            "intervention_steps": ints,
+            "passthrough_steps": total - ints,
+            "intervention_rate": float(ints / max(total, 1)),
+            # Residual magnitude (all steps)
+            "residual_mag_mean": float(mags.mean()),
+            "residual_mag_std": float(mags.std()),
+            "residual_mag_p50": float(np.median(mags)),
+            "residual_mag_p95": float(np.percentile(mags, 95)),
+            "residual_mag_max": float(mags.max()),
+            # Residual L2 norm
+            "residual_norm_mean": float(norms.mean()),
+            # Base action norm (for scale reference)
+            "base_action_norm_mean": float(base_norms.mean()),
+            # Residual as % of base action
+            "residual_pct_of_base": float(norms.mean() / max(base_norms.mean(), 1e-8) * 100),
+        }
+
+        # Stats split by gate decision
+        if intervened_mask.sum() > 0:
+            stats["residual_mag_when_intervened"] = float(mags[intervened_mask].mean())
+            stats["residual_norm_when_intervened"] = float(norms[intervened_mask].mean())
+        if passthrough_mask.sum() > 0:
+            stats["residual_mag_when_passthrough"] = float(mags[passthrough_mask].mean())
+            stats["residual_norm_when_passthrough"] = float(norms[passthrough_mask].mean())
+
+        return stats
+
     def reset(self) -> None:
         """Reset both policies and their states"""
+        if self._current_episode is not None and len(self._current_episode.get("base", [])) > 0:
+            self._episode_traces.append(self._current_episode)
+        self._current_episode = None
+        self._base_action_history = deque(maxlen=self._action_history_len)
         super().reset()
         self._base_action_buffer = None
         self._base_action_idx = 0
         self._base_obs_history = None
         if self.base_policy is not None:
             self.base_policy.reset()
+
+    def save_traces(self, path: str):
+        """Save per-episode action traces to JSON for analysis."""
+        import json
+        if self._current_episode is not None and len(self._current_episode.get("base", [])) > 0:
+            self._episode_traces.append(self._current_episode)
+            self._current_episode = None
+        with open(path, "w") as f:
+            json.dump(self._episode_traces, f)
+        print(f"[ResidualPolicyWrapper] Saved {len(self._episode_traces)} episode traces to {path}")

@@ -78,15 +78,24 @@ class SimpleResidualPolicy(BasePolicy):
         optimizer: str = "adam",
         weight_decay: float = 0.0,
         lr_layer_decay: float = 1.0,
+        # ====== Action History ======
+        action_history_len: int = 1,
         # ====== Two-Stage Training ======
         stage2_ckpt_path: Optional[str] = None,  # If set, freeze backbone+action, train intervention only
+        gate_first_ckpt_path: Optional[str] = None,  # If set, load gate from ckpt, freeze gate, train action only
         dropout: float = 0.0,
+        predict_oracle_action: bool = False,
+        residual_dead_zone: float = 0.0,
+        train_all_steps: bool = False,
+        use_base_embedding: bool = False,
+        base_embedding_dim: int = 256,
         **kwargs,
     ):
         # Filter out kwargs that LightningModule doesn't accept
         _allowed = {"online_eval", "policy_wrapper", "robot_type"}
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in _allowed}
         super().__init__(*args, **filtered_kwargs)
+        self._action_history_len = action_history_len
 
         self._prop_dim = prop_dim
         self._prop_keys = prop_keys
@@ -112,6 +121,8 @@ class SimpleResidualPolicy(BasePolicy):
         in_dim = feature_fusion_output_dim
         for _ in range(action_net_hidden_depth):
             layers.extend([nn.Linear(in_dim, action_net_hidden_dim), activation_fn()])
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
             in_dim = action_net_hidden_dim
         layers.append(nn.Linear(in_dim, action_dim))
         layers.append(nn.Tanh())  # constrain output to [-1, 1]
@@ -130,11 +141,19 @@ class SimpleResidualPolicy(BasePolicy):
         else:
             self.intervention_head = None
 
+        if use_base_embedding:
+            self._embedding_proj = nn.Linear(base_embedding_dim, feature_fusion_output_dim)
+
         # Loss config
         self._intervention_loss_weight = intervention_loss_weight
         self._supervise_zero_residual_off_intervention = supervise_zero_residual_off_intervention
         self._zero_residual_loss_weight = zero_residual_loss_weight
         self._off_intervention_residual_l1_weight = off_intervention_residual_l1_weight
+
+        # Experiment knobs
+        self._predict_oracle_action = predict_oracle_action
+        self._residual_dead_zone = residual_dead_zone
+        self._train_all_steps = train_all_steps
 
         # Load frozen base policy
         assert base_policy_ckpt_path is not None, "Must provide base_policy_ckpt_path!"
@@ -167,13 +186,28 @@ class SimpleResidualPolicy(BasePolicy):
             freeze_params(self.action_net)
             print(f"[SimpleResidualPolicy] Frozen: feature_extractor, action_net. Training: intervention_head only.")
 
+        # Gate-first: load gate from checkpoint, freeze it, train action head only
+        self._gate_first = gate_first_ckpt_path is not None
+        if self._gate_first:
+            assert use_intervention_head, "Gate-first requires use_intervention_head=true"
+            print(f"[SimpleResidualPolicy] Gate-first: loading gate from {gate_first_ckpt_path}")
+            ckpt = load_torch(gate_first_ckpt_path, map_location="cpu")
+            state = ckpt["state_dict"]
+            own_state = self.state_dict()
+            for k, v in state.items():
+                if k in own_state and "intervention_head" in k:
+                    own_state[k] = v
+            self.load_state_dict(own_state, strict=False)
+            freeze_params(self.intervention_head)
+            print(f"[SimpleResidualPolicy] Frozen: intervention_head. Training: feature_extractor, action_net.")
+
     def _load_base_policy(self, base_policy_name: str, ckpt_path: str, extra_overrides: Optional[List[str]] = None):
         """Load and freeze the base policy."""
         overrides = [f"arch={base_policy_name}"]
 
         # Collect CLI overrides (same logic as ResidualPolicy)
         def _skip(o: str) -> bool:
-            return o.startswith("module.") or o.startswith("+module.") or o.startswith("++module.")
+            return o.startswith("module.") or o.startswith("+module.") or o.startswith("++module.") or o.startswith("--")
 
         cli_overrides = []
         if GlobalHydra.instance().is_initialized():
@@ -213,6 +247,7 @@ class SimpleResidualPolicy(BasePolicy):
 
     def forward(self, obs):
         """Forward pass: extract features, predict residual action."""
+        base_embedding = obs.pop("base_embedding", None)
         # Build proprioception
         prop_obs = []
         for key in self._prop_keys:
@@ -224,8 +259,19 @@ class SimpleResidualPolicy(BasePolicy):
         prop_obs = torch.cat(prop_obs, dim=-1)
         obs["proprioception"] = prop_obs
         obs = {k: obs[k] for k in self._features}
+        # Ensure all tensors on same device
+        for k, v in obs.items():
+            if isinstance(v, torch.Tensor) and v.device != prop_obs.device:
+                obs[k] = v.to(prop_obs.device)
 
         features = self.feature_extractor(obs)  # (B, T, D)
+        if base_embedding is not None:
+            be = base_embedding.to(features.device)
+            if be.dim() == 2:
+                be = be.unsqueeze(0)
+            if be.shape[1] != features.shape[1]:
+                be = be[:, -1:, :].expand(-1, features.shape[1], -1)
+            features = features + self._embedding_proj(be) if hasattr(self, '_embedding_proj') else features
         residual_action = self.action_net(features)  # (B, T, action_dim)
         intervention_dist = self.intervention_head(features) if self._use_intervention_head else None
         return residual_action, intervention_dist
@@ -233,7 +279,15 @@ class SimpleResidualPolicy(BasePolicy):
     @torch.no_grad()
     def act_bundle(self, obs, deterministic=None):
         """Inference: return (residual_action, intervention, intervention_weight)."""
-        residual_action, intervention_dist = self.forward(obs)
+        processed = self.process_data(obs, extract_action=False)
+        residual_action, intervention_dist = self.forward(processed)
+
+        if self._residual_dead_zone > 0:
+            residual_action = torch.where(
+                residual_action.abs() < self._residual_dead_zone,
+                torch.zeros_like(residual_action),
+                residual_action,
+            )
 
         if intervention_dist is None:
             # No intervention head → always intervene (always apply residual)
@@ -295,9 +349,9 @@ class SimpleResidualPolicy(BasePolicy):
         action_valid_mask = intervention_mask & pad_mask
         non_intervention_mask = (~intervention_mask) & pad_mask
 
-        # Compute residual targets
-        base_action = batch["base_action"]
-        oracle_action = batch["oracle_action"]
+        # Compute residual targets (pop so they don't go to forward())
+        base_action = batch.pop("base_action_target")
+        oracle_action = batch.pop("oracle_action")
 
         # Split arm vs gripper
         base_arm, base_grip = base_action[..., :-1], base_action[..., -1:]
@@ -307,13 +361,21 @@ class SimpleResidualPolicy(BasePolicy):
         base_grip = torch.where(base_grip >= 0, 1.0, 0.0)
         oracle_grip = torch.where(oracle_grip >= 0, 1.0, 0.0)
 
-        residual_arm = oracle_arm - base_arm
-        residual_grip = oracle_grip - base_grip
-        target_action = torch.cat([residual_arm, residual_grip], dim=-1)
+        if self._predict_oracle_action:
+            # Predict oracle arm only; gripper target = base gripper (pass through)
+            target_action = torch.cat([oracle_arm, base_grip], dim=-1)
+        else:
+            residual_arm = oracle_arm - base_arm
+            residual_grip = oracle_grip - base_grip
+            target_action = torch.cat([residual_arm, residual_grip], dim=-1)
 
-        # Zero-residual on non-intervention timesteps
+        # Supervision on non-intervention timesteps
         if self._supervise_zero_residual_off_intervention:
-            target_action = torch.where(intervention_mask.unsqueeze(-1), target_action, torch.zeros_like(target_action))
+            if self._predict_oracle_action:
+                base_passthrough = torch.cat([base_arm, base_grip], dim=-1)
+                target_action = torch.where(intervention_mask.unsqueeze(-1), target_action, base_passthrough)
+            else:
+                target_action = torch.where(intervention_mask.unsqueeze(-1), target_action, torch.zeros_like(target_action))
             action_valid_mask = pad_mask  # supervise all timesteps
 
         # Forward
@@ -322,7 +384,10 @@ class SimpleResidualPolicy(BasePolicy):
         # MSE loss on residual action
         mse = ((pred_residual - target_action) ** 2).sum(dim=-1)  # (B, T)
 
-        intervention_mse = (mse * (intervention_mask & pad_mask)).sum() / (intervention_mask & pad_mask).sum().clamp_min(1)
+        if self._train_all_steps:
+            intervention_mse = (mse * pad_mask).sum() / pad_mask.sum().clamp_min(1)
+        else:
+            intervention_mse = (mse * (intervention_mask & pad_mask)).sum() / (intervention_mask & pad_mask).sum().clamp_min(1)
 
         if self._supervise_zero_residual_off_intervention:
             non_int_mse = (mse * non_intervention_mask).sum() / non_intervention_mask.sum().clamp_min(1)
@@ -339,7 +404,13 @@ class SimpleResidualPolicy(BasePolicy):
         # Intervention head loss
         if intervention_dist is not None:
             raw_int_loss = intervention_dist.imitation_loss(intervention_mask.long(), reduction="none").reshape(pad_mask.shape)
-            int_loss = (raw_int_loss * pad_mask).sum() / pad_mask.sum()
+            # Weight false positives more heavily for oracle prediction
+            if self._predict_oracle_action:
+                fp_weight = 3.0
+                weights = torch.where(intervention_mask, 1.0, fp_weight)
+                int_loss = (raw_int_loss * weights * pad_mask).sum() / (weights * pad_mask).sum()
+            else:
+                int_loss = (raw_int_loss * pad_mask).sum() / pad_mask.sum()
             int_acc = intervention_dist.imitation_accuracy(intervention_mask.long(), mask=pad_mask)
         else:
             int_loss = torch.tensor(0.0, device=mse.device)
@@ -373,10 +444,19 @@ class SimpleResidualPolicy(BasePolicy):
             data["odom"] = data_batch["obs"]["odom"]
         if "task" in self._features:
             data["task"] = data_batch["obs"]["task"]
+        if "base_action" in self._features:
+            if self._action_history_len > 1 and "base_action_history" in data_batch:
+                data["base_action"] = data_batch["base_action_history"].unsqueeze(1)
+            elif "base_action" in data_batch:
+                data["base_action"] = data_batch["base_action"]
+            elif extract_action and "policy" in data_batch and "base_action" in data_batch["policy"]:
+                data["base_action"] = data_batch["policy"]["base_action"]
+        if "dp_embedding" in data_batch:
+            data["base_embedding"] = data_batch["dp_embedding"]
         if extract_action:
             data.update({
                 "int_state": data_batch["policy"]["int_state"],
-                "base_action": data_batch["policy"]["base_action"],
+                "base_action_target": data_batch["policy"]["base_action"],
                 "oracle_action": data_batch["policy"]["oracle_action"],
                 "masks": data_batch["masks"],
             })

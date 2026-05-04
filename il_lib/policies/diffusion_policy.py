@@ -116,6 +116,7 @@ class DiffusionPolicy(BasePolicy):
         obs = {k: obs[k] for k in self._features}  # filter obs to only include features we have
         self._check_forward_input_shape(obs, noisy_traj, diffusion_timesteps)
         obs_feature = self.feature_extractor(obs)  # (B, T_O, D)
+        self._last_obs_embedding = obs_feature.detach()
 
         pred = self.backbone(
             sample=noisy_traj,
