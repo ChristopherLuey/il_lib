@@ -144,83 +144,80 @@ class ResidualPolicy(BasePolicy):
         self._off_intervention_residual_l1_weight = off_intervention_residual_l1_weight
         self._learn_gripper_action = learn_gripper_action
         self._include_robot_gripper_action_input = include_robot_gripper_action_input
-        # load base policy
-        assert base_policy_ckpt_path is not None, "Must provide base_policy_ckpt_path to load base policy weights!"
         
-        # base_policy is a config name (e.g., "diffusion_rgbd_unet")
-        # Load it using Hydra compose with CLI overrides
-        overrides = [f"arch={base_policy}"]
-        
-        # Get CLI overrides from the current Hydra run, excluding the arch parameter
-        # and any residual-module-specific overrides that should not leak into the
-        # nested base-policy compose.
-        def _skip_nested_module_override(override: str) -> bool:
-            return (
-                override.startswith("module.")
-                or override.startswith("+module.")
-                or override.startswith("++module.")
-            )
+        self._base_policy = None
+        if base_policy_ckpt_path is not None:
+            assert base_policy is not None, "Must provide base_policy config name when base_policy_ckpt_path is provided!"
 
-        cli_overrides = []
-        if GlobalHydra.instance().is_initialized():
-            try:
-                hydra_cfg = HydraConfig.get()
-                cli_overrides = [
-                    o for o in hydra_cfg.overrides.task
+            # base_policy is a config name (e.g., "diffusion_rgbd_unet")
+            overrides = [f"arch={base_policy}"]
+
+            # Filter out residual-module-specific overrides that should not leak
+            # into the nested base-policy compose.
+            def _skip_nested_module_override(override: str) -> bool:
+                return (
+                    override.startswith("module.")
+                    or override.startswith("+module.")
+                    or override.startswith("++module.")
+                )
+
+            cli_overrides = []
+            if GlobalHydra.instance().is_initialized():
+                try:
+                    hydra_cfg = HydraConfig.get()
+                    cli_overrides = [
+                        o for o in hydra_cfg.overrides.task
+                        if not o.startswith("arch=")
+                        and not _skip_nested_module_override(o)
+                    ]
+                except Exception:
+                    cli_overrides = []
+
+            # In serve/eval mode HydraConfig may be incomplete. Fall back to
+            # original CLI so the nested base-policy compose still sees robot/task.
+            if (
+                not any(o.startswith("robot=") for o in cli_overrides)
+                or not any(o.startswith("task=") for o in cli_overrides)
+            ):
+                argv_overrides = [
+                    o for o in sys.argv[1:]
                     if not o.startswith("arch=")
                     and not _skip_nested_module_override(o)
                 ]
-            except Exception:
-                cli_overrides = []
+                for override in argv_overrides:
+                    if override not in cli_overrides:
+                        cli_overrides.append(override)
 
-        # In serve/eval mode HydraConfig may be incomplete here. Fall back to the
-        # original CLI so the nested base-policy compose still sees robot/task.
-        if (
-            not any(o.startswith("robot=") for o in cli_overrides)
-            or not any(o.startswith("task=") for o in cli_overrides)
-        ):
-            argv_overrides = [
-                o for o in sys.argv[1:]
-                if not o.startswith("arch=")
-                and not _skip_nested_module_override(o)
-            ]
-            for override in argv_overrides:
-                if override not in cli_overrides:
-                    cli_overrides.append(override)
+            overrides.extend(cli_overrides)
 
-        overrides.extend(cli_overrides)
-        
-        # Add any additional overrides from base_policy_overrides parameter
-        if base_policy_overrides is not None:
-            overrides.extend(base_policy_overrides)
-        
-        if GlobalHydra.instance().is_initialized():
-            # If Hydra is already initialized, use compose with overrides
-            base_policy_cfg = compose(config_name="base_config", overrides=overrides)
-            base_policy_cfg = base_policy_cfg.module
-        else:
-            # If not initialized, we need to initialize it first
-            config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs")
-            config_dir = os.path.abspath(config_dir)
-            with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
+            if base_policy_overrides is not None:
+                overrides.extend(base_policy_overrides)
+
+            if GlobalHydra.instance().is_initialized():
                 base_policy_cfg = compose(config_name="base_config", overrides=overrides)
                 base_policy_cfg = base_policy_cfg.module
-        register_omegaconf_resolvers()
-        OmegaConf.resolve(base_policy_cfg)
-        self.base_policy = instantiate(base_policy_cfg, _recursive_=False)
-        
-        ckpt = load_torch(
-            base_policy_ckpt_path,
-            map_location="cpu",
-        )
-        load_state_dict(
-            self.base_policy,
-            ckpt["state_dict"],
-            strict=True
-        )
-        self.base_policy = self.base_policy.to("cuda")
-        self.base_policy.eval()
-        freeze_params(self.base_policy)
+            else:
+                config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs")
+                config_dir = os.path.abspath(config_dir)
+                with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
+                    base_policy_cfg = compose(config_name="base_config", overrides=overrides)
+                    base_policy_cfg = base_policy_cfg.module
+            register_omegaconf_resolvers()
+            OmegaConf.resolve(base_policy_cfg)
+            self._base_policy = instantiate(base_policy_cfg, _recursive_=False)
+
+            ckpt = load_torch(
+                base_policy_ckpt_path,
+                map_location="cpu",
+            )
+            load_state_dict(
+                self._base_policy,
+                ckpt["state_dict"],
+                strict=True
+            )
+            self._base_policy = self._base_policy.to("cuda")
+            self._base_policy.eval()
+            freeze_params(self._base_policy)
 
         # ====== Learning ======
         self.lr = lr
