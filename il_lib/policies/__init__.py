@@ -2,6 +2,8 @@ from .act_policy import ACT
 from .bcrnn_policy import BC_RNN
 from .diffusion_policy import DiffusionPolicy
 from .residual_policy import ResidualPolicy
+from .simplecorrectorMLP import SimpleCorrectorMLP
+from .simplecorrectorMLP_split import SimpleCorrectorMLPSplit
 from .simple_residual_policy import SimpleResidualPolicy
 from .wbvima_policy import WBVIMA
 
@@ -10,6 +12,8 @@ __all__ = [
     "BC_RNN",
     "DiffusionPolicy",
     "ResidualPolicy",
+    "SimpleCorrectorMLP",
+    "SimpleCorrectorMLPSplit",
     "SimpleResidualPolicy",
     "WBVIMA",
 ]
