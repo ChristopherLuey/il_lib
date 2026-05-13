@@ -49,11 +49,15 @@ class BehaviorDataModule(LightningDataModule):
             # limit number of demos
             if self._max_num_demos is not None:
                 all_demo_keys = all_demo_keys[: self._max_num_demos]
-            self._train_demo_keys, self._val_demo_keys = train_test_split(
-                all_demo_keys,
-                test_size=self._val_split_ratio,
-                shuffle=False,
-            )
+            if self._val_split_ratio <= 0:
+                self._train_demo_keys = all_demo_keys
+                self._val_demo_keys = all_demo_keys[:1]
+            else:
+                self._train_demo_keys, self._val_demo_keys = train_test_split(
+                    all_demo_keys,
+                    test_size=self._val_split_ratio,
+                    shuffle=False,
+                )
             # initialize datasets
             self._train_dataset = DatasetClassModule(
                 *self._args,
