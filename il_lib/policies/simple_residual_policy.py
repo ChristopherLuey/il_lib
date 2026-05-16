@@ -250,6 +250,26 @@ class SimpleResidualPolicy(BasePolicy):
         obs["proprioception"] = prop_obs
         obs = {k: obs[k] for k in self._features}
 
+        # Handle T_obs != T_act mismatch (e.g. obs_window=2, horizon=16).
+        # Obs-derived features use T_obs; base_action uses T_act.
+        # Broadcast obs features (last frame) to T_act before fusion.
+        if "base_action" in obs:
+            T_act = obs["base_action"].shape[1]
+            T_obs = prop_obs.shape[1]
+            if T_obs != T_act:
+                grouped = self.feature_extractor._group_obs(obs)
+                parts = {}
+                for k, ext in self.feature_extractor._extractors.items():
+                    feat = ext.forward(grouped[k])  # (B, T_k, D_k)
+                    if feat.shape[1] != T_act:
+                        feat = feat[:, -1:, :].expand(-1, T_act, -1)
+                    parts[k] = feat
+                fused = torch.cat([parts[k] for k in sorted(parts.keys())], dim=-1)
+                features = self.feature_extractor._head(fused)
+                residual_action = self.action_net(features)
+                intervention_dist = self.intervention_head(features) if self._use_intervention_head else None
+                return residual_action, intervention_dist
+
         features = self.feature_extractor(obs)  # (B, T, D)
         residual_action = self.action_net(features)  # (B, T, action_dim)
         intervention_dist = self.intervention_head(features) if self._use_intervention_head else None

@@ -444,15 +444,17 @@ class ResidualPolicyWrapper(PolicyWrapper):
         base_deployed_action_steps: int,  # Base policy's action chunk size
         residual_deployed_action_steps: int = 1,  # Residual policy's action step (usually 1)
         intervention_blend_mode: str = "binary",
+        residual_horizon: int = 0,  # >0 activates chunked residual inference
         **kwargs,
     ) -> None:
         # base_config injects policy_wrapper.deployed_action_steps by default.
         # ResidualPolicyWrapper manages its own deployment cadence, so drop the inherited
         # field to avoid passing deployed_action_steps twice into PolicyWrapper.
         kwargs.pop("deployed_action_steps", None)
-        # Initialize parent with residual policy's deployment frequency
-        super().__init__(*args, deployed_action_steps=residual_deployed_action_steps, **kwargs)
-        
+        # In chunked mode, deploy at the base cadence; otherwise per-step.
+        effective_deployed = base_deployed_action_steps if residual_horizon > 0 else residual_deployed_action_steps
+        super().__init__(*args, deployed_action_steps=effective_deployed, **kwargs)
+
         # Base policy specific attributes
         self.base_deployed_action_steps = base_deployed_action_steps
         self.intervention_blend_mode = intervention_blend_mode
@@ -463,6 +465,9 @@ class ResidualPolicyWrapper(PolicyWrapper):
         self._base_obs_history = deque(maxlen=self.base_obs_window_size)
         self._trace_path = os.environ.get("IIIL_RESIDUAL_TRACE_PATH")
         self._trace_step_idx = 0
+        self._residual_horizon = residual_horizon
+        self._combined_action_buffer = None
+        self._combined_action_idx = 0
         if self._trace_path:
             os.makedirs(os.path.dirname(self._trace_path), exist_ok=True)
             # Start each traced rollout with a clean file.
@@ -470,15 +475,17 @@ class ResidualPolicyWrapper(PolicyWrapper):
                 pass
     
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
+        if self._residual_horizon > 0:
+            return self._act_chunked(obs, *args, **kwargs)
+        return self._act_per_step(obs, *args, **kwargs)
+
+    def _act_per_step(self, obs: dict, *args, **kwargs) -> torch.Tensor:
         """
-        Coordinated action generation:
-        1. Get base action from buffer (refresh every base_deployed_action_steps)
-        2. Get residual correction from residual policy (every step)
-        3. Combine: final_action = base_action + residual_correction
+        Per-step residual: base predicts chunk, residual corrects each step.
         """
         obs = any_to_torch(obs, device="cpu")
         obs = self.process_obs(obs=obs)
-        
+
         # Maintain observation history
         if len(self._obs_history) == 0:
             for _ in range(self.obs_window_size):
@@ -501,7 +508,7 @@ class ResidualPolicyWrapper(PolicyWrapper):
                     self._base_obs_history.append(obs)
             else:
                 self._base_obs_history.append(obs)
-            
+
             if self.base_policy is not None:
                 # Base policy predicts action chunk
                 # DiffusionPolicy.act expects the runtime payload under the "obs" key.
@@ -510,7 +517,7 @@ class ResidualPolicyWrapper(PolicyWrapper):
                 self._base_action_idx = 0
             else:
                 raise ValueError("base_policy not found in residual policy!")
-        
+
         # Get current base action from buffer (raw radians, denormalized by base policy)
         base_action = self._base_action_buffer[self._base_action_idx]  # (A,)
         self._base_action_idx += 1
@@ -575,6 +582,139 @@ class ResidualPolicyWrapper(PolicyWrapper):
             self._trace_step_idx += 1
 
         return final_action
+
+    def _act_chunked(self, obs: dict, *args, **kwargs) -> torch.Tensor:
+        """
+        Chunked residual: both base and residual predict action chunks at the
+        same cadence.  Every base_deployed_action_steps steps we run both
+        models, element-wise add their outputs, and buffer the result.
+        """
+        obs = any_to_torch(obs, device="cpu")
+        obs = self.process_obs(obs=obs)
+
+        if len(self._obs_history) == 0:
+            for _ in range(self.obs_window_size):
+                self._obs_history.append(obs)
+        else:
+            self._obs_history.append(obs)
+        obs_stacked = any_concat(self._obs_history, dim=1)  # (1, T_obs, ...)
+
+        need_inference = (
+            self._combined_action_buffer is None
+            or self._combined_action_idx >= self.base_deployed_action_steps
+        )
+        if need_inference:
+            # --- init base policy ref ---
+            if self.base_policy is None and hasattr(self.policy, "base_policy"):
+                self.base_policy = self.policy.base_policy
+                self.base_obs_window_size = getattr(self.base_policy, "num_latest_obs", 1)
+                self._base_obs_history = deque(maxlen=self.base_obs_window_size)
+
+            if len(self._base_obs_history) == 0:
+                for _ in range(self.base_obs_window_size):
+                    self._base_obs_history.append(obs)
+            else:
+                self._base_obs_history.append(obs)
+
+            # --- base policy chunk ---
+            base_obs_stacked = any_concat(self._base_obs_history, dim=1)
+            base_chunk_raw = self.base_policy.act({"obs": base_obs_stacked}).squeeze(0)  # (T_A, A)
+            T_A = base_chunk_raw.shape[0]
+
+            # Pad to residual_horizon if base returns fewer (e.g. 15 from horizon=16, obs=2)
+            H = self._residual_horizon
+            if T_A < H:
+                pad = base_chunk_raw[-1:].expand(H - T_A, -1)
+                base_chunk_raw = torch.cat([base_chunk_raw, pad], dim=0)
+            base_chunk_raw = base_chunk_raw[:H]  # (H, A)
+
+            # Normalize full chunk to [-1, 1]
+            base_chunk_norm = self._normalize_action(
+                base_chunk_raw.to(self.policy.device).clone()
+            )  # (H, A)
+
+            # --- residual policy chunk ---
+            obs_for_residual = self._build_residual_obs_chunked(obs_stacked, base_chunk_norm)
+
+            if hasattr(self.policy, "act_bundle"):
+                residual_chunk, intervention, intervention_weight = self.policy.act_bundle(obs_for_residual)
+            else:
+                residual_chunk, intervention = self.policy.act(obs_for_residual)
+                intervention_weight = intervention.to(dtype=base_chunk_norm.dtype)
+            residual_chunk = residual_chunk.squeeze(0)  # (H, A)
+
+            # --- blend ---
+            if self.intervention_blend_mode == "always_on":
+                blend = 1.0
+            elif self.intervention_blend_mode == "weighted":
+                blend = intervention_weight.squeeze(0).unsqueeze(-1).to(
+                    device=base_chunk_norm.device, dtype=base_chunk_norm.dtype
+                )
+            else:
+                blend = (intervention.squeeze(0) >= 0.5).unsqueeze(-1).to(
+                    device=base_chunk_norm.device, dtype=base_chunk_norm.dtype
+                )
+
+            combined_norm = base_chunk_norm + blend * residual_chunk.to(base_chunk_norm.device)
+
+            # Denormalize each step and move to cpu
+            combined_raw = torch.stack([
+                self._denormalize_action(combined_norm[i].clone())
+                for i in range(combined_norm.shape[0])
+            ]).cpu()  # (H, A)
+
+            self._combined_action_buffer = combined_raw
+            self._combined_action_idx = 0
+
+            # Store for tracing
+            self._base_chunk_raw_for_trace = base_chunk_raw.detach().cpu()
+            self._base_chunk_norm_for_trace = base_chunk_norm.detach().cpu()
+            self._residual_chunk_for_trace = residual_chunk.detach().cpu()
+
+        # Pop next action from buffer
+        action = self._combined_action_buffer[self._combined_action_idx]
+        step_idx = self._combined_action_idx
+        self._combined_action_idx += 1
+
+        if self._trace_path:
+            trace_row = {
+                "step": self._trace_step_idx,
+                "intervention": 1,
+                "intervention_weight": 1.0,
+                "blend_weight": 1.0,
+                "intervention_blend_mode": self.intervention_blend_mode,
+                "base_action": self._base_chunk_raw_for_trace[step_idx].view(-1).tolist(),
+                "final_action": action.detach().view(-1).tolist(),
+                "residual_action_normalized": self._residual_chunk_for_trace[step_idx].view(-1).tolist(),
+                "base_action_normalized": self._base_chunk_norm_for_trace[step_idx].view(-1).tolist(),
+            }
+            with open(self._trace_path, "a") as f:
+                f.write(json.dumps(trace_row) + "\n")
+            self._trace_step_idx += 1
+
+        return action
+
+    def _build_residual_obs_chunked(
+        self, obs_stacked: dict, base_chunk_norm: torch.Tensor
+    ) -> dict:
+        """Build obs dict for chunked residual: obs at T_obs, base_action at H."""
+        obs_for_residual = {
+            "qpos": obs_stacked["qpos"],
+            "base_action": base_chunk_norm.unsqueeze(0),  # (1, H, A)
+        }
+        if "eef" in obs_stacked:
+            obs_for_residual["eef"] = obs_stacked["eef"]
+        if "odom" in obs_stacked:
+            obs_for_residual["odom"] = obs_stacked["odom"]
+        if hasattr(self.policy, "_features") and "rgb" in self.policy._features:
+            obs_for_residual["rgb"] = {
+                k.rsplit("::", 1)[0]: obs_stacked[k].float() / 255.0
+                for k in obs_stacked
+                if "rgb" in k
+            }
+        if hasattr(self.policy, "_features") and "task" in self.policy._features and "task" in obs_stacked:
+            obs_for_residual["task"] = obs_stacked["task"]
+        return any_to_torch(obs_for_residual, device=self.policy.device)
 
     def _build_residual_obs(self, obs_stacked: dict, base_action_normalized: torch.Tensor) -> dict:
         # base_action is (A,); expand to (1, T, A) to match obs time dimension
@@ -643,6 +783,8 @@ class ResidualPolicyWrapper(PolicyWrapper):
         super().reset()
         self._base_action_buffer = None
         self._base_action_idx = 0
+        self._combined_action_buffer = None
+        self._combined_action_idx = 0
         self.base_obs_window_size = 1
         self._base_obs_history = deque(maxlen=self.base_obs_window_size)
         self._trace_step_idx = 0
