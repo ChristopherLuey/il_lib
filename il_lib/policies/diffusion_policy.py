@@ -53,9 +53,11 @@ class DiffusionPolicy(BasePolicy):
         lr_layer_decay: float = 1.0,
         optimizer: str = "adam",
         weight_decay: float = 0.0,
+        focal_gamma: float = 0.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.focal_gamma = focal_gamma
 
         self._prop_keys = prop_keys
         self._features = set(feature_extractors.keys())
@@ -199,6 +201,11 @@ class DiffusionPolicy(BasePolicy):
         # reduce the loss according to the action mask
         # "True" indicates should calculate the loss
         action_loss = action_loss * pad_mask
+        # Focal loss: upweight hard samples, downweight easy ones
+        if self.focal_gamma > 0:
+            with torch.no_grad():
+                focal_weight = action_loss.detach() ** self.focal_gamma
+            action_loss = action_loss * focal_weight
         real_batch_size = pad_mask.sum()
         action_loss = action_loss.sum() / real_batch_size
         log_dict = {"diffusion_loss": action_loss}

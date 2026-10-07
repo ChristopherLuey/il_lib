@@ -30,7 +30,7 @@ def main():
 
     with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
         # Compose config with Hydra logging disabled
-        overrides = sys.argv[1:] + search_path_overrides + [
+        overrides = [o for o in sys.argv[1:] if not o.startswith("--port=")] + search_path_overrides + [
             "hydra.output_subdir=null",
             "hydra.run.dir=.",
             "hydra/job_logging=none",
@@ -56,11 +56,17 @@ def main():
         # instantiate wrapper for policy
         policy_wrapper = instantiate(cfg.policy_wrapper)
         policy_wrapper.policy = policy
+        # Parse --port from CLI args
+        port = 8000
+        for o in sys.argv[1:]:
+            if o.startswith("--port="):
+                port = int(o.split("=")[1])
         server = WebsocketPolicyServer(
             policy=policy_wrapper,
             host="0.0.0.0",
-            port=8000,
+            port=port,
         )
+        print(f"Serving on 0.0.0.0:{port}")
         server.serve_forever()
 
 
